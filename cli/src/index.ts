@@ -13,7 +13,8 @@ import {
 
 const usage = `Usage
   esho-plans login [--no-browser]
-  esho-plans publish <file> [--note <text>] [--shared | --internal] [--project <id|name>] [--title <title>] [--json]
+  esho-plans publish <file> [--note <text>] [--shared | --internal] [--project <id|name>] [--title <title>]
+                     [--discard-pending] [--json]
   esho-plans sync [--workspace <dir>] [--project <id|name>] [--json]
   esho-plans status [--workspace <dir>] [--json]
   esho-plans share [--replace | --revoke | --passcode <code> | --no-passcode] [--project <id|name>] [--json]
@@ -25,7 +26,7 @@ const project = { project: { type: "string" } } as const;
 const visibility = { shared: { type: "boolean" }, internal: { type: "boolean" } } as const;
 const commands = {
   login: { "no-browser": { type: "boolean" } },
-  publish: { ...project, ...visibility, note: { type: "string" }, title: { type: "string" } },
+  publish: { ...project, ...visibility, note: { type: "string" }, title: { type: "string" }, "discard-pending": { type: "boolean" } },
   sync: { ...project, workspace: { type: "string" } },
   status: { workspace: { type: "string" } },
   share: { ...project, replace: { type: "boolean" }, revoke: { type: "boolean" }, passcode: { type: "string" }, "no-passcode": { type: "boolean" } },
@@ -134,6 +135,11 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     const pending = await readPendingVisibility(root, origin);
     const projectHint = option(flags, "project")?.trim() || undefined;
     const selectedVisibility = visibilityFlag(flags);
+    if (target && flags["discard-pending"] && pending.delete(target.key)) {
+      // The owner cancels every visibility choice still waiting for this file.
+      await writePendingVisibility(root, origin, pending);
+      console.error("Discarded the pending visibility choices for " + target.key + ".");
+    }
     if (target && selectedVisibility) {
       // Saved before any network request, so the choice survives a failed publish. With no --project it goes to
       // the project of the file's only waiting choice, else to the workspace's recorded project.
@@ -166,9 +172,9 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     // Settle every saved choice on one exact project before choosing where this command publishes.
     const settled = await settlePending(api, root, previous, pending, projects, gitRemote);
     let changed = settled.changed;
-    for (const notice of settled.discarded) console.error(notice);
     // A retry with no --project goes to the project of the file's only waiting choice.
-    const waiting = target && !settled.ambiguous.has(target.key) ? pending.get(target.key) ?? [] : [];
+    const unclear = !!target && (settled.ambiguous.has(target.key) || settled.missing.has(target.key));
+    const waiting = target && !unclear ? pending.get(target.key) ?? [] : [];
     const lookup = projectHint ?? (waiting.length === 1 ? waiting[0].project : undefined);
     const { project: remote, created } = await projectFor(api, root, previous, lookup, true, gitRemote, projects);
     if (!lookup && !settled.home) {
@@ -186,6 +192,9 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     for (const { key } of candidates) {
       if (settled.ambiguous.has(key)) {
         throw new CliError(5, "Pending visibility for " + key + " names more than one project. Retry that file with --project <project ID> and --shared or --internal.");
+      }
+      if (settled.missing.has(key)) {
+        throw new CliError(5, "Pending visibility for " + key + " was saved for a project that no longer exists. Retry that file with --project <project> and --shared or --internal, or cancel the choice with publish --discard-pending.");
       }
       if (pending.has(key) && !pendingFor(pending, key, forThisProject)) {
         throw new CliError(5, "Pending visibility for " + key + " belongs to another project. Retry that publish for its own project first.");
@@ -267,7 +276,6 @@ async function setVisibility(api: Api, origin: string, target: string, flags: Fl
     const projectHint = option(flags, "project")?.trim() || undefined;
     const projects = await listProjects(api);
     const settled = await settlePending(api, root, previous, pending, projects);
-    for (const notice of settled.discarded) console.error(notice);
     if (settled.changed) await writePendingVisibility(root, origin, pending);
     const { project: remote } = await projectFor(api, root, previous, projectHint, false, undefined, projects);
     stopForUnboundChoice(pending, !!projectHint);

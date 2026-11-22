@@ -287,16 +287,52 @@ test("a choice saved under a project name cannot undo a later choice made by pro
   assert.equal(state.writes.at(-1).visibility, "internal");
   assert.equal(state.documents.prj_twin_two, undefined);
   await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+});
 
-  // A choice for a project that no longer exists is discarded instead of blocking the file.
-  await writeFile(join(root, plan), original + "<p>Last edit</p>");
-  await writeFile(pendingFile, JSON.stringify({ apiUrl: origin, documents: { "plan.html": [{ visibility: "shared", project: "Removed" }] } }));
-  const gone = await cli("publish", plan);
-  assert.equal(gone.code, 0, gone.stderr);
-  assert.match(gone.stderr, /no longer exists/);
+test("a choice whose project disappears stops the upload until it is replaced or cancelled", async (context) => {
+  const { cli, plan, root, original, state, pendingFile } = await projectsFixture(context,
+    () => [named("prj_alpha", "Alpha"), named("prj_beta", "Beta")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 0);
+  assert.equal(state.documents.prj_alpha.visibility, "shared");
+  await writeFile(join(root, plan), original + "<p>Private edit</p>");
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--project", "prj_beta", "--internal")).code, 4);
+  state.offline = false;
+  state.projects = state.projects.filter((item) => item.id !== "prj_beta");
+  const waiting = [{ visibility: "internal", project: "prj_beta" }];
+
+  const writes = state.writes.length;
+  for (const command of [["publish", plan], ["sync"], ["publish", plan], ["sync"], ["publish", plan, "--internal"]]) {
+    const stopped = await cli(...command);
+    assert.equal(stopped.code, 5, command.join(" ") + ": " + stopped.stderr);
+    assert.match(stopped.stderr, /no longer exists/);
+    assert.equal(state.writes.length, writes);
+    assert.equal(state.documents.prj_alpha.visibility, "shared");
+    assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+  }
+
+  // An explicit replacement project and visibility succeeds and writes only there.
+  const replaced = await cli("publish", plan, "--project", "prj_alpha", "--internal");
+  assert.equal(replaced.code, 0, replaced.stderr);
+  assert.equal(state.writes.length, writes + 1);
+  assert.equal(state.writes.at(-1).project, "prj_alpha");
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+
+  // Cancelling is explicit too. Without the flag the same saved choice still stops the upload.
+  await writeFile(join(root, plan), original + "<p>Later edit</p>");
+  const stale = JSON.stringify({ apiUrl: JSON.parse(await readFile(join(root, ".plans/.postplan.json"), "utf8")).apiUrl,
+    documents: { "plan.html": waiting } });
+  await writeFile(pendingFile, stale);
+  assert.equal((await cli("publish", plan)).code, 5);
+  const cancelled = await cli("publish", plan, "--discard-pending");
+  assert.equal(cancelled.code, 0, cancelled.stderr);
+  assert.match(cancelled.stderr, /Discarded the pending visibility choices/);
   assert.equal(state.writes.at(-1).project, "prj_alpha");
   assert.equal(state.writes.at(-1).visibility, undefined);
   assert.equal(state.documents.prj_alpha.visibility, "internal");
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
 });
 
 test("the newest choice wins when an earlier one is bound to the default project", async (context) => {

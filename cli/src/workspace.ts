@@ -137,18 +137,20 @@ export function replacePending(pending: PendingMap, key: string, matches: (entry
  * Settles every saved choice on one exact project, in the order the choices were made.
  *
  * - A choice with no project belongs to the workspace's default project (`home`) and is bound to it when known.
- * - A project name becomes that project's ID. A name or ID that matches no project is discarded, since the
- *   choice can no longer be applied anywhere.
+ * - A project name becomes that project's ID.
  * - A name that matches several projects stays ambiguous until a later choice for the same file names one of
  *   those projects by ID, which replaces it.
+ * - A name or ID that matches no project stays, and marks the file as missing its destination, until a later
+ *   choice for the same file names an existing project. Dropping it would let a retry fall back to another
+ *   project and keep that project's visibility.
  * - For each project the most recent choice wins.
  */
 export function resolvePending(pending: PendingMap, projects: Project[], home?: string) {
   let changed = false;
   const ambiguous = new Set<string>();
-  const discarded: string[] = [];
+  const missing = new Set<string>();
   for (const [key, entries] of [...pending]) {
-    const settled: { entry: PendingVisibility; slot: string; twins?: string[] }[] = [];
+    const settled: { entry: PendingVisibility; slot: string; twins?: string[]; gone?: true }[] = [];
     for (const entry of entries) {
       let project = entry.project ?? home;
       let twins: string[] | undefined;
@@ -158,7 +160,7 @@ export function resolvePending(pending: PendingMap, projects: Project[], home?: 
         if (named.length === 1) project = named[0].id;
         else if (named.length > 1) twins = named.map((item) => item.id);
         else {
-          discarded.push("Discarded a pending visibility choice for " + key + ": its project no longer exists.");
+          settled.push({ entry, slot: "gone:" + name, gone: true });
           continue;
         }
       }
@@ -171,8 +173,11 @@ export function resolvePending(pending: PendingMap, projects: Project[], home?: 
     const latest = new Map<string, PendingVisibility>();
     settled.forEach((item, index) => {
       const later = settled.slice(index + 1);
-      if (item.twins?.some((id) => later.some((other) => !other.twins && other.entry.project === id))) return;
+      const exact = later.filter((other) => !other.twins && !other.gone && other.entry.project !== undefined);
+      if (item.twins?.some((id) => exact.some((other) => other.entry.project === id))) return;
+      if (item.gone && exact.length) return;
       if (item.twins) ambiguous.add(key);
+      if (item.gone) missing.add(key);
       latest.delete(item.slot);
       latest.set(item.slot, item.entry);
     });
@@ -183,7 +188,7 @@ export function resolvePending(pending: PendingMap, projects: Project[], home?: 
       changed = true;
     }
   }
-  return { changed, ambiguous, discarded };
+  return { changed, ambiguous, missing };
 }
 
 /** Finds the workspace's default project without creating one, then settles the saved choices against it. */
