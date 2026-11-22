@@ -320,19 +320,34 @@ test("a choice whose project disappears stops the upload until it is replaced or
   assert.equal(state.documents.prj_alpha.visibility, "internal");
   await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
 
-  // Cancelling is explicit too. Without the flag the same saved choice still stops the upload.
-  await writeFile(join(root, plan), original + "<p>Later edit</p>");
-  const stale = JSON.stringify({ apiUrl: JSON.parse(await readFile(join(root, ".plans/.postplan.json"), "utf8")).apiUrl,
-    documents: { "plan.html": waiting } });
-  await writeFile(pendingFile, stale);
-  assert.equal((await cli("publish", plan)).code, 5);
-  const cancelled = await cli("publish", plan, "--discard-pending");
+  // Another queued destination is not a recovery decision: with B and C both queued and B gone, nothing is sent.
+  state.documents.prj_alpha.visibility = "shared";
+  state.projects.push(named("prj_beta", "Beta"), named("prj_gamma", "Gamma"));
+  await writeFile(join(root, plan), original + "<p>Second private edit</p>");
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--project", "prj_beta", "--internal")).code, 4);
+  assert.equal((await cli("publish", plan, "--project", "prj_gamma", "--internal")).code, 4);
+  state.offline = false;
+  state.projects = state.projects.filter((item) => item.id !== "prj_beta");
+  const both = [{ visibility: "internal", project: "prj_beta" }, { visibility: "internal", project: "prj_gamma" }];
+  const before = state.writes.length;
+  for (const command of [["publish", plan], ["sync"], ["publish", plan, "--project", "prj_gamma"], ["sync"]]) {
+    const stopped = await cli(...command);
+    assert.equal(stopped.code, 5, command.join(" ") + ": " + stopped.stderr);
+    assert.equal(state.writes.length, before);
+    assert.equal(state.documents.prj_alpha.visibility, "shared");
+    assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], both);
+  }
+
+  // Cancelling is local: with A still shared it removes the choices and sends nothing.
+  const cancelled = await cli("publish", plan, "--discard-pending", "--json");
   assert.equal(cancelled.code, 0, cancelled.stderr);
-  assert.match(cancelled.stderr, /Discarded the pending visibility choices/);
-  assert.equal(state.writes.at(-1).project, "prj_alpha");
-  assert.equal(state.writes.at(-1).visibility, undefined);
-  assert.equal(state.documents.prj_alpha.visibility, "internal");
+  assert.deepEqual(JSON.parse(cancelled.stdout), { discarded: true, published: [] });
+  assert.equal(state.writes.length, before);
+  assert.equal(state.documents.prj_alpha.visibility, "shared");
   await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+  assert.equal((await cli("publish", plan, "--discard-pending", "--internal")).code, 5);
+  assert.equal(state.writes.length, before);
 });
 
 test("the newest choice wins when an earlier one is bound to the default project", async (context) => {

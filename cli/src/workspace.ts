@@ -138,14 +138,15 @@ export function replacePending(pending: PendingMap, key: string, matches: (entry
  *
  * - A choice with no project belongs to the workspace's default project (`home`) and is bound to it when known.
  * - A project name becomes that project's ID.
- * - A name that matches several projects stays ambiguous until a later choice for the same file names one of
- *   those projects by ID, which replaces it.
- * - A name or ID that matches no project stays, and marks the file as missing its destination, until a later
- *   choice for the same file names an existing project. Dropping it would let a retry fall back to another
- *   project and keep that project's visibility.
+ * - A name that matches several projects stays and marks the file ambiguous. A name or ID that matches no
+ *   project stays and marks the file as missing its destination. Dropping either would let a retry fall back
+ *   to another project and keep that project's visibility.
+ * - Only `replacement` clears those: the file whose choice the current command just saved with an explicit
+ *   project and visibility. An ambiguous name gives way when that choice names one of its projects, a missing
+ *   destination when it names any existing project. Choices saved earlier never count as a replacement.
  * - For each project the most recent choice wins.
  */
-export function resolvePending(pending: PendingMap, projects: Project[], home?: string) {
+export function resolvePending(pending: PendingMap, projects: Project[], home?: string, replacement?: string) {
   let changed = false;
   const ambiguous = new Set<string>();
   const missing = new Set<string>();
@@ -171,11 +172,11 @@ export function resolvePending(pending: PendingMap, projects: Project[], home?: 
       });
     }
     const latest = new Map<string, PendingVisibility>();
-    settled.forEach((item, index) => {
-      const later = settled.slice(index + 1);
-      const exact = later.filter((other) => !other.twins && !other.gone && other.entry.project !== undefined);
-      if (item.twins?.some((id) => exact.some((other) => other.entry.project === id))) return;
-      if (item.gone && exact.length) return;
+    // The command's own choice is the last one saved for its file.
+    const newest = replacement === key ? settled.at(-1) : undefined;
+    const chosen = newest && !newest.twins && !newest.gone ? newest.entry.project : undefined;
+    settled.forEach((item) => {
+      if (chosen !== undefined && (item.gone || item.twins?.includes(chosen))) return;
       if (item.twins) ambiguous.add(key);
       if (item.gone) missing.add(key);
       latest.delete(item.slot);
@@ -192,14 +193,14 @@ export function resolvePending(pending: PendingMap, projects: Project[], home?: 
 }
 
 /** Finds the workspace's default project without creating one, then settles the saved choices against it. */
-export async function settlePending(api: Api, root: string, record: WorkspaceRecord | null, pending: PendingMap, projects: Project[], remote?: string | null) {
+export async function settlePending(api: Api, root: string, record: WorkspaceRecord | null, pending: PendingMap, projects: Project[], remote?: string | null, replacement?: string) {
   let home: Project | undefined;
   try {
     home = (await projectFor(api, root, record, undefined, false, remote, projects)).project;
   } catch (error) {
     if (!(error instanceof CliError && error.code === 2)) throw error;
   }
-  return { home, ...resolvePending(pending, projects, home?.id) };
+  return { home, ...resolvePending(pending, projects, home?.id, replacement) };
 }
 
 export const unboundChoice = (entry: PendingVisibility) => !entry.project;

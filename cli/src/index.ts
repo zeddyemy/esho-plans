@@ -135,10 +135,15 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     const pending = await readPendingVisibility(root, origin);
     const projectHint = option(flags, "project")?.trim() || undefined;
     const selectedVisibility = visibilityFlag(flags);
-    if (target && flags["discard-pending"] && pending.delete(target.key)) {
-      // The owner cancels every visibility choice still waiting for this file.
-      await writePendingVisibility(root, origin, pending);
-      console.error("Discarded the pending visibility choices for " + target.key + ".");
+    if (flags["discard-pending"]) {
+      // Cancelling is local only. It never uploads, so the cancelled edit stays on this computer.
+      if (!target || selectedVisibility || projectHint) throw new CliError(5, "Use --discard-pending with a file and no other publish options.");
+      const discarded = pending.delete(target.key);
+      if (discarded) await writePendingVisibility(root, origin, pending);
+      print({ discarded, published: [] }, [discarded
+        ? "Discarded the pending visibility choices for " + target.key + ". Nothing was published."
+        : "No visibility choice is waiting for " + target.key + ". Nothing was published."], !!flags.json);
+      return;
     }
     if (target && selectedVisibility) {
       // Saved before any network request, so the choice survives a failed publish. With no --project it goes to
@@ -170,7 +175,9 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     const gitRemote = gitMetadata(root, candidates[0].path).remote;
     const projects = await listProjects(api);
     // Settle every saved choice on one exact project before choosing where this command publishes.
-    const settled = await settlePending(api, root, previous, pending, projects, gitRemote);
+    // Only a command that states the file's project and visibility outright may replace a stale choice for it.
+    const replacement = target && selectedVisibility && projectHint ? target.key : undefined;
+    const settled = await settlePending(api, root, previous, pending, projects, gitRemote, replacement);
     let changed = settled.changed;
     // A retry with no --project goes to the project of the file's only waiting choice.
     const unclear = !!target && (settled.ambiguous.has(target.key) || settled.missing.has(target.key));
@@ -194,7 +201,7 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
         throw new CliError(5, "Pending visibility for " + key + " names more than one project. Retry that file with --project <project ID> and --shared or --internal.");
       }
       if (settled.missing.has(key)) {
-        throw new CliError(5, "Pending visibility for " + key + " was saved for a project that no longer exists. Retry that file with --project <project> and --shared or --internal, or cancel the choice with publish --discard-pending.");
+        throw new CliError(5, "Pending visibility for " + key + " was saved for a project that no longer exists. Retry that file with --project <project> and --shared or --internal, or cancel the choice with publish <file> --discard-pending, which uploads nothing.");
       }
       if (pending.has(key) && !pendingFor(pending, key, forThisProject)) {
         throw new CliError(5, "Pending visibility for " + key + " belongs to another project. Retry that publish for its own project first.");
