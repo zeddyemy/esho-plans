@@ -1,0 +1,11 @@
+{
+  "name": "esho-plans",
+  "private": true,
+  "packageManager": "pnpm@11.20.0",
+  "scripts": {
+    "dev": "pnpm --filter @esho-plans/site dev",
+    "build": "pnpm --filter @esho-plans/site build",
+    "check": "pnpm -r check",
+    "test": "pnpm -r test"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ADP Plan"
+  short_description: "Create clear HTML project plans in .plans"
+  default_prompt: "Use $adp-plan to create an implementation plan for this project."

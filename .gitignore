@@ -1,0 +1,20 @@
+# Workspace support folders (never commit)
+.agents/
+.plans/
+.docs/
+.claude/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Tooling
+node_modules/
+dist/
+.wrangler/
+coverage/
+.DS_Store

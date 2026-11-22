@@ -1,0 +1,3 @@
+display_name: Agent driven project workflow
+short_description: Set up a users's agent workflow.
+default_prompt: Set up my standard project workflow here. Create or update AGENTS.md and brain.md, then explain how future agents should work with me.
