@@ -1,0 +1,8 @@
+# Set a local OAuth app's public client ID to test sign-in locally.
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+SESSION_KEY=
+GRANT_KEY=
+LINK_ENC_KEY=
+KEY_PEPPER=
+PASSCODE_PEPPER=

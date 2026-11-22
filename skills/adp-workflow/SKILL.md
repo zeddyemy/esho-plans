@@ -96,6 +96,7 @@ Use this shape:
 # Project Brain
 
 Running memory for decisions, fixes, investigations, and known risks.
+When present, `.plans/.postplan.json` records the Plans Hub project ID and private plan URLs.
 
 ## 1. Initial Project Setup (YYYY-MM-DD)
 
@@ -109,6 +110,7 @@ Running memory for decisions, fixes, investigations, and known risks.
 ## During Every Task
 
 1. First read `AGENTS.md` and the project memory file if they exist. This is a hard starting step, not optional context gathering.
+   Read `.plans/.postplan.json` when present to identify the Plans Hub project and published documents.
 2. Check repo status before editing.
 3. Use fast search tools (`rg`, `rg --files`) when available.
 4. Read relevant files in full enough to understand the flow.
