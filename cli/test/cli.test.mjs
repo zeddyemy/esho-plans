@@ -719,6 +719,44 @@ test("publishing a path reassigned to another document leaves the first document
     [{ project: "prj_alpha", document: "doc_prj_alpha", keys: ["plan.html"], confirmed: true }]);
 });
 
+test("removing a document keeps the choice waiting for another document that now uses its path", async (context) => {
+  const alpha = "aaaaaaaaaaaaaaaa";
+  const first = "doc_" + alpha;
+  for (const interrupted of [false, true]) {
+    const { cli, plan, plans, root, original, state, pendingFile } = await projectsFixture(context, () => [named(alpha, "Alpha")]);
+    assert.equal((await cli("publish", plan, "--project", alpha)).code, 0);
+    // The path is assigned to a second, shared document, as set --document does.
+    const recordFile = join(plans, ".postplan.json");
+    const record = JSON.parse(await readFile(recordFile, "utf8"));
+    record.documents["plan.html"].id = "doc_bbbbbbbbbbbbbbbb";
+    await writeFile(recordFile, JSON.stringify(record));
+    await writeFile(join(root, plan), original + "<p>Private edit to the second document</p>");
+    state.offline = true;
+    assert.equal((await cli("publish", plan, "--internal")).code, 4);
+    state.offline = false;
+    const waiting = [{ visibility: "internal", project: alpha }];
+
+    if (interrupted) {
+      // The answer is lost, and the retry finishes the removal.
+      state.loseDeleteResponse = true;
+      assert.equal((await cli("remove", first, "--project", alpha)).code, 4);
+      state.loseDeleteResponse = false;
+      assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+    }
+    const removed = await cli("remove", first, "--project", alpha);
+    assert.equal(removed.code, 0, removed.stderr);
+    assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+
+    // The second document is shared on the hub. Its edit must go up as internal.
+    state.documents[alpha] = { visibility: "shared" };
+    state.receiptId = "doc_bbbbbbbbbbbbbbbb";
+    const syncing = await cli("sync", "--json");
+    assert.equal(syncing.code, 0, syncing.stderr);
+    assert.equal(state.writes.at(-1).visibility, "internal");
+    assert.equal(state.documents[alpha].visibility, "internal");
+  }
+});
+
 test("sync reports an unconfirmed removal in a workspace with no plans", async (context) => {
   const alpha = "aaaaaaaaaaaaaaaa";
   const { cli, plan, root, state } = await projectsFixture(context, () => [named(alpha, "Alpha")]);

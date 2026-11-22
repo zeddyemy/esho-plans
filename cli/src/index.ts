@@ -417,6 +417,9 @@ async function removeDocument(api: Api, origin: string, target: string, flags: F
     const matchId = suppliedId ? target : key && known[key]?.id;
     const match = documents.find((document) => matchId ? document.id === matchId : document.doc_key === key);
     const removals = await readRemovals(root, origin);
+    // A path belongs to a document unless the workspace record maps it to a different one (set --document).
+    // Another document's path, and the visibility choice waiting for it, are never touched by this removal.
+    const ownPath = (documentId: string) => (path: string) => !known[path] || known[path].id === documentId;
     // An earlier attempt that never heard back from the server is finished here once the document is gone.
     let removal = removals.find((entry) => entry.project === remote.id && !entry.confirmed &&
       (match ? entry.document === match.id : entry.document === matchId || (!!key && entry.keys.includes(key))));
@@ -426,8 +429,8 @@ async function removeDocument(api: Api, origin: string, target: string, flags: F
       // A new attempt replaces every earlier entry for this document, confirmed or not, and keeps their paths.
       const earlier = removals.filter((entry) => entry.project === remote.id && entry.document === match.id);
       const keys = new Set([...Object.keys(known).filter((path) => known[path].id === match.id), match.doc_key,
-        ...earlier.flatMap((entry) => entry.keys)]);
-      if (key) keys.add(key);
+        ...earlier.flatMap((entry) => entry.keys)].filter(ownPath(match.id)));
+      if (key && ownPath(match.id)(key)) keys.add(key);
       const others = removals.filter((entry) => !earlier.includes(entry));
       removal = { project: remote.id, document: match.id, keys: [...keys] };
       removals.splice(0, removals.length, ...others, removal);
@@ -448,7 +451,9 @@ async function removeDocument(api: Api, origin: string, target: string, flags: F
     const done = removal!;
     // A visibility choice still waiting for the removed document must not come back with it.
     let cleared = false;
-    for (const path of done.keys) cleared = replacePending(pending, path, (choice) => choice.project === remote.id) || cleared;
+    for (const path of done.keys.filter(ownPath(done.document))) {
+      cleared = replacePending(pending, path, (choice) => choice.project === remote.id) || cleared;
+    }
     if (cleared) await writePendingVisibility(root, origin, pending);
     done.confirmed = true;
     await writeRemovals(root, origin, removals);
