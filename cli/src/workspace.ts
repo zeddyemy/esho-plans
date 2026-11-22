@@ -10,7 +10,9 @@ export type Project = { id: string; name: string; repo_hint: string | null; work
 export type DocumentMetadata = { id: string; doc_key: string; content_hash: string; visibility: Visibility; updated_at: string };
 export type RecordEntry = { id: string; visibility: Visibility; privateUrl: string; contentHash?: string; publishedAt?: string; docKey?: string };
 export type WorkspaceRecord = { apiUrl: string; project: { id: string; name: string }; documents: Record<string, RecordEntry> };
-type PendingVisibility = { visibility: Visibility; project?: string };
+export type PendingVisibility = { visibility: Visibility; project?: string };
+// One file can have a pending choice for more than one project, so each file keeps a list.
+export type PendingMap = Map<string, PendingVisibility[]>;
 
 const recordName = ".postplan.json";
 const pendingName = ".postplan.pending.json";
@@ -96,22 +98,42 @@ export async function readPendingVisibility(root: string, origin: string) {
     if (!value.documents || typeof value.documents !== "object" || Array.isArray(value.documents)) {
       throw new Error("Invalid document map.");
     }
-    const entries = Object.entries(value.documents) as [string, PendingVisibility][];
-    for (const [, entry] of entries) {
-      if (!entry || (entry.visibility !== "internal" && entry.visibility !== "shared") ||
-        (entry.project !== undefined && (typeof entry.project !== "string" || !entry.project.trim()))) {
-        throw new Error("Invalid pending visibility.");
+    const pending: PendingMap = new Map();
+    for (const [key, stored] of Object.entries(value.documents)) {
+      // Earlier versions stored a single choice per file.
+      const entries = (Array.isArray(stored) ? stored : [stored]) as PendingVisibility[];
+      for (const entry of entries) {
+        if (!entry || (entry.visibility !== "internal" && entry.visibility !== "shared") ||
+          (entry.project !== undefined && (typeof entry.project !== "string" || !entry.project.trim()))) {
+          throw new Error("Invalid pending visibility.");
+        }
       }
+      if (entries.length) pending.set(key, entries);
     }
-    return new Map(entries);
+    return pending;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map<string, PendingVisibility>();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map() as PendingMap;
     if (error instanceof CliError) throw error;
     throw new CliError(5, "Could not read the pending publish record.");
   }
 }
 
-export function writePendingVisibility(root: string, origin: string, pending: Map<string, PendingVisibility>) {
+export function pendingFor(pending: PendingMap, key: string, matches: (entry: PendingVisibility) => boolean) {
+  // The most recent matching choice wins.
+  return pending.get(key)?.filter(matches).at(-1);
+}
+
+/** Removes the matching choices for a file and optionally records one in their place. Other projects' choices stay. */
+export function replacePending(pending: PendingMap, key: string, matches: (entry: PendingVisibility) => boolean, next?: PendingVisibility) {
+  const current = pending.get(key) ?? [];
+  const kept = current.filter((entry) => !matches(entry));
+  if (next) kept.push(next);
+  if (kept.length) pending.set(key, kept);
+  else pending.delete(key);
+  return !!next || kept.length !== current.length;
+}
+
+export function writePendingVisibility(root: string, origin: string, pending: PendingMap) {
   const path = join(root, ".plans", pendingName);
   return pending.size ? writeJson(path, { apiUrl: origin, documents: Object.fromEntries(pending) }) : rm(path, { force: true });
 }

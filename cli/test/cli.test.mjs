@@ -175,6 +175,40 @@ test("sync replays an offline internal publish and keeps an override scoped to i
   assert.equal(state.writes.at(-1).visibility, "internal");
 });
 
+test("a publish to a second project keeps the first project's pending visibility", async (context) => {
+  const { cli, plan, plans, root, original, state, alternate } = await publishFixture(context);
+  assert.equal(state.document.visibility, "shared");
+  const edited = original + "<p>Private edit</p>";
+  await writeFile(join(root, plan), edited);
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--internal")).code, 4);
+  state.offline = false;
+
+  const second = await cli("publish", plan, "--project", alternate.id, "--internal");
+  assert.equal(second.code, 0, second.stderr);
+  assert.equal(state.writes.at(-1).url, "/api/v1/projects/" + alternate.id + "/documents");
+  const pending = JSON.parse(await readFile(join(plans, ".postplan.pending.json"), "utf8"));
+  assert.deepEqual(pending.documents["plan.html"], [{ visibility: "internal", project: project.id }]);
+
+  // The mock keeps one document, so restore the first project's shared copy before syncing it.
+  state.document.visibility = "shared";
+  const syncing = await cli("sync", "--json");
+  assert.equal(syncing.code, 0, syncing.stderr);
+  assert.equal(state.writes.at(-1).url, "/api/v1/projects/" + project.id + "/documents");
+  assert.equal(state.writes.at(-1).html, edited);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.document.visibility, "internal");
+  await assert.rejects(readFile(join(plans, ".postplan.pending.json")), { code: "ENOENT" });
+
+  // A pending file written by an earlier CLI version holds one choice per file and is still honoured.
+  await writeFile(join(root, plan), edited + "<p>Second edit</p>");
+  state.document.visibility = "shared";
+  const legacy = JSON.stringify({ apiUrl: pending.apiUrl, documents: { "plan.html": { visibility: "internal", project: project.id } } });
+  await writeFile(join(plans, ".postplan.pending.json"), legacy);
+  assert.equal((await cli("sync")).code, 0);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+});
+
 test("a visibility change preserves the local content baseline when another copy is newer", async (context) => {
   const { cli, plan, plans, root, original, state } = await publishFixture(context);
   const localHash = fixtureHash(original);

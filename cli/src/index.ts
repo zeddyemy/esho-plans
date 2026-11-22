@@ -6,9 +6,9 @@ import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { apiClient, apiOrigin, CliError, keyFormat, saveCredentials, type Api } from "./api.js";
 import {
-  contentHash, docKey, gitMetadata, htmlFiles, locate, planHtml, projectFor, readPendingVisibility, readRecord,
-  withRecordLock, workspace, writePendingVisibility, writeRecord, type DocumentMetadata, type Project,
-  type Visibility, type WorkspaceRecord,
+  contentHash, docKey, gitMetadata, htmlFiles, locate, pendingFor, planHtml, projectFor, readPendingVisibility, readRecord,
+  replacePending, withRecordLock, workspace, writePendingVisibility, writeRecord, type DocumentMetadata,
+  type PendingVisibility, type Project, type Visibility, type WorkspaceRecord,
 } from "./workspace.js";
 
 const usage = `Usage
@@ -123,12 +123,16 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     const pending = await readPendingVisibility(root, origin);
     const projectHint = option(flags, "project")?.trim() || undefined;
     const selectedVisibility = visibilityFlag(flags);
+    // A retry with no --project goes to the project of the file's only pending choice.
+    const waiting = target ? pending.get(target.key) ?? [] : [];
+    const retryProject = waiting.length === 1 ? waiting[0].project : undefined;
     if (target && selectedVisibility) {
-      const project = projectHint ?? pending.get(target.key)?.project ?? previous?.project.id;
-      pending.set(target.key, { visibility: selectedVisibility, project });
+      const project = projectHint ?? retryProject ?? previous?.project.id;
+      // Replace only this project's choice. A choice saved for another project must survive this command.
+      replacePending(pending, target.key, (entry) => entry.project === project, { visibility: selectedVisibility, project });
       await writePendingVisibility(root, origin, pending);
     }
-    const lookup = projectHint ?? (target ? pending.get(target.key)?.project : undefined);
+    const lookup = projectHint ?? retryProject;
     const candidates: { path: string; key: string; html: string }[] = [];
     let skipped = 0;
     for (const path of files) {
@@ -144,14 +148,14 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       print({ published: [], skipped }, ["All plans are current."], !!flags.json);
       return;
     }
-    if (!target && !lookup && !previous && candidates.some(({ key }) => pending.get(key)?.project)) {
+    if (!target && !lookup && !previous && candidates.some(({ key }) => pending.get(key)?.some((entry) => entry.project))) {
       throw new CliError(5, "Select the pending publish's project with --project or retry that file with publish.");
     }
     const api = await apiClient(origin);
     const { project: remote, created } = await projectFor(api, root, previous, lookup, true, gitMetadata(root, candidates[0].path).remote);
+    const forThisProject = (entry: PendingVisibility) => !entry.project || entry.project === remote.id || entry.project === lookup;
     for (const { key } of candidates) {
-      const intent = pending.get(key);
-      if (intent?.project && intent.project !== remote.id && intent.project !== lookup) {
+      if (pending.has(key) && !pendingFor(pending, key, forThisProject)) {
         throw new CliError(5, "Pending visibility for " + key + " belongs to another project. Retry that publish with its original project.");
       }
     }
@@ -160,14 +164,15 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     const published: Receipt[] = [];
     if (created) console.error("Created project " + remote.name + " (" + remote.id + ").");
     for (const { path, key, html } of candidates) {
-      const intent = pending.get(key);
+      const intent = pendingFor(pending, key, forThisProject);
       if (intent && intent.project !== remote.id) {
-        pending.set(key, { ...intent, project: remote.id });
+        replacePending(pending, key, forThisProject, { ...intent, project: remote.id });
         await writePendingVisibility(root, origin, pending);
       }
       const receipt = await publishFile(api, root, path, key, html, record, flags, intent?.visibility);
       if (canSave) await writeRecord(root, record);
-      if (pending.delete(key)) await writePendingVisibility(root, origin, pending);
+      // Clear only the choice that was just applied.
+      if (replacePending(pending, key, forThisProject)) await writePendingVisibility(root, origin, pending);
       published.push(receipt);
       if (command === "sync" && !flags.json) console.log(receiptLines(receipt).join("\n"));
     }
@@ -242,9 +247,9 @@ async function setVisibility(api: Api, origin: string, target: string, flags: Fl
     const entries = key ? [key] : Object.keys(record.documents).filter((path) => record.documents[path].id === match.id);
     let updatedPending = false;
     for (const entry of entries) {
-      const intent = pending.get(entry);
-      if (intent && (!intent.project || intent.project === remote.id || intent.project === projectHint)) {
-        pending.set(entry, { visibility: next, project: remote.id });
+      const forThisProject = (intent: PendingVisibility) => !intent.project || intent.project === remote.id || intent.project === projectHint;
+      if (pendingFor(pending, entry, forThisProject)) {
+        replacePending(pending, entry, forThisProject, { visibility: next, project: remote.id });
         updatedPending = true;
       }
     }
