@@ -244,7 +244,7 @@ async function projectsFixture(context, makeProjects) {
     state.documents[id] = { visibility };
     return send(response, 200, {
       ...successReceipt,
-      document: { ...successReceipt.document, id: "doc_" + id, visibility, contentHash: fixtureHash(body.html) },
+      document: { ...successReceipt.document, id: state.receiptId ?? "doc_" + id, visibility, contentHash: fixtureHash(body.html) },
     });
   });
   server.listen(0, "127.0.0.1");
@@ -698,6 +698,39 @@ test("restoring a removed document is internal even if it was shared again from 
   const entries = JSON.parse(await readFile(join(plans, ".postplan.removals.json"), "utf8")).removals;
   assert.deepEqual(entries, [{ project: "prj_alpha", document: "doc_prj_alpha", keys: ["plan.html"] }]);
   assert.match((await cli("status")).stdout, /plan\.html · \w+ · removal not confirmed/);
+});
+
+test("publishing a path reassigned to another document leaves the first document's removal in place", async (context) => {
+  const { cli, plan, plans, root, original, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha")).code, 0);
+  assert.equal((await cli("remove", plan)).code, 0);
+  // The path is then assigned to a different document, as set --document does.
+  const recordFile = join(plans, ".postplan.json");
+  const record = JSON.parse(await readFile(recordFile, "utf8"));
+  record.documents["plan.html"].id = "doc_other";
+  await writeFile(recordFile, JSON.stringify(record));
+  assert.doesNotMatch((await cli("status")).stdout, /removed from the hub/);
+  state.receiptId = "doc_other";
+  await writeFile(join(root, plan), original + "<p>Edit to the other document</p>");
+  const published = await cli("publish", plan);
+  assert.equal(published.code, 0, published.stderr);
+  assert.equal(state.writes.at(-1).visibility, undefined);
+  assert.deepEqual(JSON.parse(await readFile(join(plans, ".postplan.removals.json"), "utf8")).removals,
+    [{ project: "prj_alpha", document: "doc_prj_alpha", keys: ["plan.html"], confirmed: true }]);
+});
+
+test("sync reports an unconfirmed removal in a workspace with no plans", async (context) => {
+  const alpha = "aaaaaaaaaaaaaaaa";
+  const { cli, plan, root, state } = await projectsFixture(context, () => [named(alpha, "Alpha")]);
+  await rm(join(root, plan));
+  state.documents[alpha] = { visibility: "shared" };
+  state.dropDelete = true;
+  assert.equal((await cli("remove", "doc_" + alpha, "--project", alpha)).code, 4);
+  state.dropDelete = false;
+  const syncing = await cli("sync", "--project", alpha, "--json");
+  assert.equal(syncing.code, 5);
+  assert.equal(JSON.parse(syncing.stdout).unconfirmed[0].retry, "esho-plans remove doc_" + alpha + " --project " + alpha);
+  assert.match(syncing.stderr, /was not confirmed/);
 });
 
 test("a removed file that can no longer be read does not stop sync for other plans", async (context) => {
