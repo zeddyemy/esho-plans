@@ -209,6 +209,118 @@ test("a publish to a second project keeps the first project's pending visibility
   assert.equal(state.writes.at(-1).visibility, "internal");
 });
 
+// A mock API that keeps each project's document separately.
+async function projectsFixture(context, makeProjects) {
+  const { root, plans } = await workspaceFixture(context);
+  const plan = ".plans/plan.html";
+  const original = "<!doctype html><title>Plan</title><p>Published version</p>";
+  await writeFile(join(root, plan), original);
+  const state = { offline: false, writes: [], projects: makeProjects(root), documents: {} };
+  const server = createServer(async (request, response) => {
+    if (state.offline) return request.socket.destroy();
+    if (request.url === "/api/v1/projects") return send(response, 200, { projects: state.projects });
+    const id = /^\/api\/v1\/projects\/([^/]+)\/documents$/.exec(request.url)?.[1];
+    if (!id || request.method !== "PUT") return send(response, 404, { error: "Missing" });
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    state.writes.push({ project: id, ...body });
+    const visibility = body.visibility ?? state.documents[id]?.visibility ?? "internal";
+    state.documents[id] = { visibility };
+    return send(response, 200, {
+      ...successReceipt,
+      document: { ...successReceipt.document, id: "doc_" + id, visibility, contentHash: fixtureHash(body.html) },
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  context.after(() => new Promise((resolveClose) => server.close(resolveClose)));
+  const origin = "http://127.0.0.1:" + server.address().port;
+  const cli = (...args) => run(root, origin, goodKey, ...args);
+  const pendingFile = join(plans, ".postplan.pending.json");
+  return { cli, plan, root, original, state, origin, pendingFile };
+}
+
+const named = (id, name) => ({ id, name, repo_hint: null, workspace_hint: null });
+
+test("a choice saved under a project name cannot undo a later choice made by project ID", async (context) => {
+  const { cli, plan, root, original, state, origin, pendingFile } = await projectsFixture(context,
+    () => [named("prj_alpha", "Alpha"), named("prj_twin_one", "Twin"), named("prj_twin_two", "Twin")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha")).code, 0);
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--project", "Alpha", "--shared")).code, 4);
+  state.offline = false;
+  const internal = await cli("publish", plan, "--project", "prj_alpha", "--internal");
+  assert.equal(internal.code, 0, internal.stderr);
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+
+  await writeFile(join(root, plan), original + "<p>Later edit</p>");
+  const later = await cli("publish", plan);
+  assert.equal(later.code, 0, later.stderr);
+  assert.equal(state.writes.at(-1).project, "prj_alpha");
+  assert.equal(state.writes.at(-1).visibility, undefined);
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+
+  // A saved name that matches several projects stops the upload.
+  await writeFile(join(root, plan), original + "<p>Another edit</p>");
+  await writeFile(pendingFile, JSON.stringify({ apiUrl: origin, documents: { "plan.html": [{ visibility: "shared", project: "Twin" }] } }));
+  const writes = state.writes.length;
+  const unclear = await cli("sync");
+  assert.equal(unclear.code, 5);
+  assert.match(unclear.stderr, /more than one project/);
+  assert.equal(state.writes.length, writes);
+});
+
+test("a choice saved without a project is never applied to an explicit --project", async (context) => {
+  const { cli, plan, state, pendingFile } = await projectsFixture(context,
+    (root) => [named("prj_default", root.split("/").at(-1)), named("prj_other", "Other")]);
+  state.documents.prj_other = { visibility: "internal" };
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--shared")).code, 4);
+  state.offline = false;
+  assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], [{ visibility: "shared" }]);
+
+  // The choice is bound to the workspace's default project and the upload to the other project stops.
+  const waiting = [{ visibility: "shared", project: "prj_default" }];
+  const override = await cli("publish", plan, "--project", "prj_other");
+  assert.equal(override.code, 5, override.stderr);
+  assert.match(override.stderr, /another project/);
+  assert.equal(state.writes.length, 0);
+  assert.equal(state.documents.prj_other.visibility, "internal");
+  assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+
+  // An explicit choice for the other project is its own. It leaves the default project's choice waiting, even
+  // though this first successful publish records the other project for the workspace.
+  const explicit = await cli("publish", plan, "--project", "prj_other", "--internal");
+  assert.equal(explicit.code, 0, explicit.stderr);
+  assert.equal(state.documents.prj_other.visibility, "internal");
+  assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+
+  const retry = await cli("publish", plan);
+  assert.equal(retry.code, 0, retry.stderr);
+  assert.equal(state.writes.at(-1).project, "prj_default");
+  assert.equal(state.writes.at(-1).visibility, "shared");
+  assert.equal(state.documents.prj_other.visibility, "internal");
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+});
+
+test("a choice saved before the workspace has any project stops an explicit --project", async (context) => {
+  const { cli, plan, state, pendingFile } = await projectsFixture(context, () => [named("prj_other", "Other")]);
+  state.documents.prj_other = { visibility: "internal" };
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--shared")).code, 4);
+  state.offline = false;
+  for (const flags of [[], ["--internal"]]) {
+    const override = await cli("publish", plan, "--project", "prj_other", ...flags);
+    assert.equal(override.code, 5, override.stderr);
+    assert.match(override.stderr, /without --project first/);
+  }
+  assert.equal(state.writes.length, 0);
+  assert.equal(state.documents.prj_other.visibility, "internal");
+  assert.equal(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"].some((entry) => entry.visibility === "shared" && !entry.project), true);
+});
+
 test("a visibility change preserves the local content baseline when another copy is newer", async (context) => {
   const { cli, plan, plans, root, original, state } = await publishFixture(context);
   const localHash = fixtureHash(original);

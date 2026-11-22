@@ -133,6 +133,36 @@ export function replacePending(pending: PendingMap, key: string, matches: (entry
   return !!next || kept.length !== current.length;
 }
 
+/**
+ * Rewrites saved project names as project IDs and keeps the most recent choice per project, so a choice saved
+ * under a name and one saved under the same project's ID cannot both survive. Returns the files whose saved name
+ * matches more than one project.
+ */
+export function resolvePending(pending: PendingMap, projects: Project[]) {
+  let changed = false;
+  const ambiguous = new Set<string>();
+  for (const [key, entries] of pending) {
+    const latest = new Map<string | undefined, PendingVisibility>();
+    for (const entry of entries) {
+      let project = entry.project;
+      if (project !== undefined && !projects.some((item) => item.id === project)) {
+        const name = project.toLowerCase();
+        const named = projects.filter((item) => item.name.toLowerCase() === name);
+        if (named.length === 1) project = named[0].id;
+        else if (named.length > 1) ambiguous.add(key);
+      }
+      latest.delete(project);
+      latest.set(project, project === entry.project ? entry : { ...entry, project });
+    }
+    const next = [...latest.values()];
+    if (next.length !== entries.length || next.some((entry, index) => entry !== entries[index])) {
+      pending.set(key, next);
+      changed = true;
+    }
+  }
+  return { changed, ambiguous };
+}
+
 export function writePendingVisibility(root: string, origin: string, pending: PendingMap) {
   const path = join(root, ".plans", pendingName);
   return pending.size ? writeJson(path, { apiUrl: origin, documents: Object.fromEntries(pending) }) : rm(path, { force: true });
@@ -291,12 +321,12 @@ export async function projectFor(api: Api, root: string, record: WorkspaceRecord
     throw new CliError(2, "Several projects match. Use --project with an ID.",
       matches.map(({ id, name, repo_hint }) => ({ id, name, repo: repo_hint })));
   }
-  if (matches[0]) return { project: matches[0], created: false };
+  if (matches[0]) return { project: matches[0], created: false, projects };
   if (hint || record || !create) throw new CliError(2, "No project matches this workspace. Publish a plan or use --project.",
     projects.map(({ id, name }) => ({ id, name })));
   const idempotencyKey = createHash("sha256").update(workspaceRemote ? "repo:" + workspaceRemote : "workspace:" + root).digest("base64url");
   const { project } = await api<{ project: Project }>("/projects", "POST", { name: label, workspaceHint: label, repoHint: workspaceRemote, idempotencyKey });
-  return { project, created: true };
+  return { project, created: true, projects: [...projects, project] };
 }
 
 export async function planHtml(path: string) {

@@ -15,7 +15,7 @@ esho-plans sync --workspace /path/to/workspace
 
 New documents start as internal. Publishing again with the same path updates the same URL. `--shared` makes a document visible through the project's client link. `--internal` moves it back. Pass `--project <id|name>` to choose a different project for one command. The CLI writes private URLs and content hashes to `.plans/.postplan.json`. For a renamed file, `esho-plans set .plans/renamed.html --document <docId> --internal` keeps the existing document ID and visibility you select.
 
-If a publish with an explicit visibility fails, the CLI records that choice locally and applies it when the file is retried for the same project. When `sync` cannot match the project, retry the file with `publish` or specify the original project.
+If a publish with an explicit visibility fails, the CLI records that choice locally, per project, and applies it when the file is retried for the same project. A choice saved before the workspace had a project belongs to the workspace's default project and is never applied to a `--project` override. When the CLI stops because a choice is waiting for another project, retry that file with `publish` for its own project first.
 
 ### Publish using the API
 

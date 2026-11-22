@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 import { apiClient, apiOrigin, CliError, keyFormat, saveCredentials, type Api } from "./api.js";
 import {
   contentHash, docKey, gitMetadata, htmlFiles, locate, pendingFor, planHtml, projectFor, readPendingVisibility, readRecord,
-  replacePending, withRecordLock, workspace, writePendingVisibility, writeRecord, type DocumentMetadata,
+  replacePending, resolvePending, withRecordLock, workspace, writePendingVisibility, writeRecord, type DocumentMetadata,
   type PendingVisibility, type Project, type Visibility, type WorkspaceRecord,
 } from "./workspace.js";
 
@@ -152,11 +152,40 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       throw new CliError(5, "Select the pending publish's project with --project or retry that file with publish.");
     }
     const api = await apiClient(origin);
-    const { project: remote, created } = await projectFor(api, root, previous, lookup, true, gitMetadata(root, candidates[0].path).remote);
-    const forThisProject = (entry: PendingVisibility) => !entry.project || entry.project === remote.id || entry.project === lookup;
+    const gitRemote = gitMetadata(root, candidates[0].path).remote;
+    const { project: remote, created, projects } = await projectFor(api, root, previous, lookup, true, gitRemote);
+    // A choice saved without a project belongs to the workspace's default project. Bind it to that project now,
+    // before this command can publish elsewhere or record a different project for the workspace.
+    const unbound = (entry: PendingVisibility) => !entry.project;
+    let bound = false;
+    if ([...pending.values()].some((entries) => entries.some(unbound))) {
+      let home: Project | undefined = lookup ? undefined : remote;
+      if (lookup) {
+        try {
+          home = (await projectFor(api, root, previous, undefined, false, gitRemote)).project;
+        } catch (error) {
+          if (!(error instanceof CliError && error.code === 2)) throw error;
+        }
+      }
+      if (home) {
+        for (const key of [...pending.keys()]) {
+          const choice = pendingFor(pending, key, unbound);
+          if (choice) bound = replacePending(pending, key, unbound, { ...choice, project: home.id }) || bound;
+        }
+      }
+    }
+    const resolved = resolvePending(pending, projects);
+    if (bound || resolved.changed) await writePendingVisibility(root, origin, pending);
+    const forThisProject = (entry: PendingVisibility) => entry.project === remote.id;
     for (const { key } of candidates) {
+      if (pendingFor(pending, key, unbound)) {
+        throw new CliError(5, "Pending visibility for " + key + " was saved before this workspace had a project. Retry that publish without --project first.");
+      }
+      if (resolved.ambiguous.has(key)) {
+        throw new CliError(5, "Pending visibility for " + key + " names more than one project. Retry that publish with --project and a project ID.");
+      }
       if (pending.has(key) && !pendingFor(pending, key, forThisProject)) {
-        throw new CliError(5, "Pending visibility for " + key + " belongs to another project. Retry that publish with its original project.");
+        throw new CliError(5, "Pending visibility for " + key + " belongs to another project. Retry that publish for its own project first.");
       }
     }
     const record = recordFor(origin, remote, previous);
@@ -237,7 +266,8 @@ async function setVisibility(api: Api, origin: string, target: string, flags: Fl
     const previous = await readRecord(root, origin);
     const pending = await readPendingVisibility(root, origin);
     const projectHint = option(flags, "project")?.trim() || undefined;
-    const { project: remote } = await projectFor(api, root, previous, projectHint);
+    const { project: remote, projects } = await projectFor(api, root, previous, projectHint);
+    if (resolvePending(pending, projects).changed) await writePendingVisibility(root, origin, pending);
     const record = recordFor(origin, remote, previous);
     const { documents } = await api<{ documents: DocumentMetadata[] }>("/projects/" + remote.id + "/documents");
     const key = targetFile?.key;
@@ -247,7 +277,7 @@ async function setVisibility(api: Api, origin: string, target: string, flags: Fl
     const entries = key ? [key] : Object.keys(record.documents).filter((path) => record.documents[path].id === match.id);
     let updatedPending = false;
     for (const entry of entries) {
-      const forThisProject = (intent: PendingVisibility) => !intent.project || intent.project === remote.id || intent.project === projectHint;
+      const forThisProject = (intent: PendingVisibility) => intent.project ? intent.project === remote.id : !projectHint;
       if (pendingFor(pending, entry, forThisProject)) {
         replacePending(pending, entry, forThisProject, { visibility: next, project: remote.id });
         updatedPending = true;
