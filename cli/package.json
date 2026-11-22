@@ -1,0 +1,17 @@
+{
+  "name": "@esho-plans/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "esho-plans": "dist/index.js" },
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "check": "tsc --noEmit",
+    "test": "pnpm build && node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "~5.9.3"
+  }
+}

@@ -5,7 +5,23 @@
   "compatibility_date": "2026-11-01",
   "workers_dev": true,
   "preview_urls": false,
+  "routes": [{ "pattern": "postplan.esho.dev", "custom_domain": true }],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "esho-plans",
+      "database_id": "8086fa0f-db08-4511-9068-2cc88cd4013b"
+    }
+  ],
   "vars": {
-    "APP_HOST": "postplan.esho.dev"
+    "APP_HOST": "postplan.esho.dev",
+    "CONTENT_HOST": "esho-plans.zeddyemy.workers.dev",
+    "OWNER_GITHUB_ID": "51033541",
+    "GITHUB_CLIENT_ID": "Ov23li196xGI9UsEvfcD"
   }
 }
