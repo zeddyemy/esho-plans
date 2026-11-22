@@ -134,34 +134,70 @@ export function replacePending(pending: PendingMap, key: string, matches: (entry
 }
 
 /**
- * Rewrites saved project names as project IDs and keeps the most recent choice per project, so a choice saved
- * under a name and one saved under the same project's ID cannot both survive. Returns the files whose saved name
- * matches more than one project.
+ * Settles every saved choice on one exact project, in the order the choices were made.
+ *
+ * - A choice with no project belongs to the workspace's default project (`home`) and is bound to it when known.
+ * - A project name becomes that project's ID. A name or ID that matches no project is discarded, since the
+ *   choice can no longer be applied anywhere.
+ * - A name that matches several projects stays ambiguous until a later choice for the same file names one of
+ *   those projects by ID, which replaces it.
+ * - For each project the most recent choice wins.
  */
-export function resolvePending(pending: PendingMap, projects: Project[]) {
+export function resolvePending(pending: PendingMap, projects: Project[], home?: string) {
   let changed = false;
   const ambiguous = new Set<string>();
-  for (const [key, entries] of pending) {
-    const latest = new Map<string | undefined, PendingVisibility>();
+  const discarded: string[] = [];
+  for (const [key, entries] of [...pending]) {
+    const settled: { entry: PendingVisibility; slot: string; twins?: string[] }[] = [];
     for (const entry of entries) {
-      let project = entry.project;
+      let project = entry.project ?? home;
+      let twins: string[] | undefined;
       if (project !== undefined && !projects.some((item) => item.id === project)) {
         const name = project.toLowerCase();
         const named = projects.filter((item) => item.name.toLowerCase() === name);
         if (named.length === 1) project = named[0].id;
-        else if (named.length > 1) ambiguous.add(key);
+        else if (named.length > 1) twins = named.map((item) => item.id);
+        else {
+          discarded.push("Discarded a pending visibility choice for " + key + ": its project no longer exists.");
+          continue;
+        }
       }
-      latest.delete(project);
-      latest.set(project, project === entry.project ? entry : { ...entry, project });
+      settled.push({
+        entry: project === entry.project ? entry : { ...entry, project },
+        slot: twins ? "name:" + project!.toLowerCase() : project === undefined ? "default" : "id:" + project,
+        twins,
+      });
     }
+    const latest = new Map<string, PendingVisibility>();
+    settled.forEach((item, index) => {
+      const later = settled.slice(index + 1);
+      if (item.twins?.some((id) => later.some((other) => !other.twins && other.entry.project === id))) return;
+      if (item.twins) ambiguous.add(key);
+      latest.delete(item.slot);
+      latest.set(item.slot, item.entry);
+    });
     const next = [...latest.values()];
     if (next.length !== entries.length || next.some((entry, index) => entry !== entries[index])) {
-      pending.set(key, next);
+      if (next.length) pending.set(key, next);
+      else pending.delete(key);
       changed = true;
     }
   }
-  return { changed, ambiguous };
+  return { changed, ambiguous, discarded };
 }
+
+/** Finds the workspace's default project without creating one, then settles the saved choices against it. */
+export async function settlePending(api: Api, root: string, record: WorkspaceRecord | null, pending: PendingMap, projects: Project[], remote?: string | null) {
+  let home: Project | undefined;
+  try {
+    home = (await projectFor(api, root, record, undefined, false, remote, projects)).project;
+  } catch (error) {
+    if (!(error instanceof CliError && error.code === 2)) throw error;
+  }
+  return { home, ...resolvePending(pending, projects, home?.id) };
+}
+
+export const unboundChoice = (entry: PendingVisibility) => !entry.project;
 
 export function writePendingVisibility(root: string, origin: string, pending: PendingMap) {
   const path = join(root, ".plans", pendingName);
@@ -297,8 +333,12 @@ export function gitMetadata(root: string, file: string) {
   };
 }
 
-export async function projectFor(api: Api, root: string, record: WorkspaceRecord | null, hint?: string, create = false, remote?: string | null) {
-  const { projects } = await api<{ projects: Project[] }>("/projects");
+export async function listProjects(api: Api) {
+  return (await api<{ projects: Project[] }>("/projects")).projects;
+}
+
+export async function projectFor(api: Api, root: string, record: WorkspaceRecord | null, hint?: string, create = false, remote?: string | null, known?: Project[]) {
+  const projects = known ?? await listProjects(api);
   const label = basename(root);
   const workspaceRemote = remote ?? gitMetadata(root, join(root, "workspace")).remote;
   let matches: Project[];

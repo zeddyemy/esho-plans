@@ -220,10 +220,18 @@ async function projectsFixture(context, makeProjects) {
     if (state.offline) return request.socket.destroy();
     if (request.url === "/api/v1/projects") return send(response, 200, { projects: state.projects });
     const id = /^\/api\/v1\/projects\/([^/]+)\/documents$/.exec(request.url)?.[1];
-    if (!id || request.method !== "PUT") return send(response, 404, { error: "Missing" });
+    const listed = (project) => ({ id: "doc_" + project, doc_key: "plan.html", content_hash: "sha256:mock",
+      updated_at: successReceipt.document.updatedAt, visibility: state.documents[project].visibility });
+    if (id && request.method === "GET") return send(response, 200, { documents: state.documents[id] ? [listed(id)] : [] });
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString());
+    const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+    const patched = /^\/api\/v1\/documents\/doc_(.+)$/.exec(request.url)?.[1];
+    if (patched && request.method === "PATCH" && state.documents[patched]) {
+      state.documents[patched].visibility = body.visibility;
+      return send(response, 200, { document: listed(patched) });
+    }
+    if (!id || request.method !== "PUT") return send(response, 404, { error: "Missing" });
     state.writes.push({ project: id, ...body });
     const visibility = body.visibility ?? state.documents[id]?.visibility ?? "internal";
     state.documents[id] = { visibility };
@@ -238,7 +246,7 @@ async function projectsFixture(context, makeProjects) {
   const origin = "http://127.0.0.1:" + server.address().port;
   const cli = (...args) => run(root, origin, goodKey, ...args);
   const pendingFile = join(plans, ".postplan.pending.json");
-  return { cli, plan, root, original, state, origin, pendingFile };
+  return { cli, plan, plans, root, original, state, origin, pendingFile };
 }
 
 const named = (id, name) => ({ id, name, repo_hint: null, workspace_hint: null });
@@ -270,6 +278,55 @@ test("a choice saved under a project name cannot undo a later choice made by pro
   assert.equal(unclear.code, 5);
   assert.match(unclear.stderr, /more than one project/);
   assert.equal(state.writes.length, writes);
+
+  // Naming one of those projects by ID with an explicit visibility settles it, and only that project is written.
+  const chosen = await cli("publish", plan, "--project", "prj_twin_one", "--internal");
+  assert.equal(chosen.code, 0, chosen.stderr);
+  assert.equal(state.writes.length, writes + 1);
+  assert.equal(state.writes.at(-1).project, "prj_twin_one");
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.prj_twin_two, undefined);
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+
+  // A choice for a project that no longer exists is discarded instead of blocking the file.
+  await writeFile(join(root, plan), original + "<p>Last edit</p>");
+  await writeFile(pendingFile, JSON.stringify({ apiUrl: origin, documents: { "plan.html": [{ visibility: "shared", project: "Removed" }] } }));
+  const gone = await cli("publish", plan);
+  assert.equal(gone.code, 0, gone.stderr);
+  assert.match(gone.stderr, /no longer exists/);
+  assert.equal(state.writes.at(-1).project, "prj_alpha");
+  assert.equal(state.writes.at(-1).visibility, undefined);
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+});
+
+test("the newest choice wins when an earlier one is bound to the default project", async (context) => {
+  const projects = (root) => [named("prj_default", root.split("/").at(-1)), named("prj_other", "Other")];
+  const first = await projectsFixture(context, projects);
+  first.state.offline = true;
+  assert.equal((await first.cli("publish", first.plan, "--shared")).code, 4);
+  first.state.offline = false;
+  const internal = await first.cli("publish", first.plan, "--project", "prj_default", "--internal", "--json");
+  assert.equal(internal.code, 0, internal.stderr);
+  assert.equal(JSON.parse(internal.stdout).document.visibility, "internal");
+  assert.equal(first.state.writes.at(-1).visibility, "internal");
+  assert.equal(first.state.documents.prj_default.visibility, "internal");
+  await assert.rejects(readFile(first.pendingFile), { code: "ENOENT" });
+
+  // The same sequence with set: the older choice must not be replayed by the next publish.
+  const second = await projectsFixture(context, projects);
+  second.state.documents.prj_default = { visibility: "shared" };
+  second.state.offline = true;
+  assert.equal((await second.cli("publish", second.plan, "--shared")).code, 4);
+  second.state.offline = false;
+  const set = await second.cli("set", second.plan, "--project", "prj_default", "--internal");
+  assert.equal(set.code, 0, set.stderr);
+  assert.equal(second.state.documents.prj_default.visibility, "internal");
+  await writeFile(join(second.root, second.plan), second.original + "<p>Edit</p>");
+  const next = await second.cli("publish", second.plan);
+  assert.equal(next.code, 0, next.stderr);
+  assert.equal(second.state.writes.at(-1).project, "prj_default");
+  assert.notEqual(second.state.writes.at(-1).visibility, "shared");
+  assert.equal(second.state.documents.prj_default.visibility, "internal");
 });
 
 test("a choice saved without a project is never applied to an explicit --project", async (context) => {
@@ -305,20 +362,40 @@ test("a choice saved without a project is never applied to an explicit --project
   await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
 });
 
-test("a choice saved before the workspace has any project stops an explicit --project", async (context) => {
-  const { cli, plan, state, pendingFile } = await projectsFixture(context, () => [named("prj_other", "Other")]);
+test("a choice saved before the workspace has any project is never handed to a named project", async (context) => {
+  const { cli, plan, plans, root, state, pendingFile } = await projectsFixture(context, () => [named("prj_other", "Other")]);
   state.documents.prj_other = { visibility: "internal" };
   state.offline = true;
   assert.equal((await cli("publish", plan, "--shared")).code, 4);
   state.offline = false;
-  for (const flags of [[], ["--internal"]]) {
-    const override = await cli("publish", plan, "--project", "prj_other", ...flags);
-    assert.equal(override.code, 5, override.stderr);
-    assert.match(override.stderr, /without --project first/);
+  const waiting = async () => JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"];
+
+  // Publishing a different file to a named project would record that project as the workspace default.
+  await writeFile(join(root, ".plans/other.html"), "<!doctype html><title>Other</title><p>Other</p>");
+  for (const command of [["publish", ".plans/other.html", "--project", "prj_other", "--internal"], ["publish", plan, "--project", "prj_other"],
+    ["sync", "--project", "prj_other"], ["set", plan, "--project", "prj_other", "--internal"]]) {
+    const stopped = await cli(...command);
+    assert.equal(stopped.code, 5, command.join(" ") + ": " + stopped.stderr);
+    assert.match(stopped.stderr, /Pending visibility for plan\.html was saved before this workspace had a project/);
   }
   assert.equal(state.writes.length, 0);
   assert.equal(state.documents.prj_other.visibility, "internal");
-  assert.equal(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"].some((entry) => entry.visibility === "shared" && !entry.project), true);
+  await assert.rejects(readFile(join(plans, ".postplan.json")), { code: "ENOENT" });
+  assert.equal((await waiting()).some((entry) => entry.visibility === "shared" && !entry.project), true);
+
+  // Stating the file's project and visibility outright replaces the earlier choice.
+  const explicit = await cli("publish", plan, "--project", "prj_other", "--internal");
+  assert.equal(explicit.code, 0, explicit.stderr);
+  assert.match(explicit.stderr, /Replaced an earlier pending visibility choice/);
+  assert.equal(state.writes.length, 1);
+  assert.equal(state.writes[0].visibility, "internal");
+  assert.equal(state.documents.prj_other.visibility, "internal");
+  // Only the stopped command's own choice for the other file is still waiting.
+  assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents,
+    { "other.html": [{ visibility: "internal", project: "prj_other" }] });
+  const plain = await cli("publish", plan);
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.equal(state.documents.prj_other.visibility, "internal");
 });
 
 test("a visibility change preserves the local content baseline when another copy is newer", async (context) => {
