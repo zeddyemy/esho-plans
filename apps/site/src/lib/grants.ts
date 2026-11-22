@@ -9,17 +9,10 @@ type Grant = {
   hash: string;
   exp: number;
   audience: Audience;
-  download?: true;
 };
 
-export async function grantUrl(env: Bindings, contentOrigin: string, document: DocumentMetadata, audience: Audience, download = false) {
-  const grant: Grant = {
-    doc: document.id,
-    hash: document.content_hash,
-    exp: Date.now() + 300_000,
-    audience,
-    ...(download ? { download: true as const } : {}),
-  };
+export async function grantUrl(env: Bindings, contentOrigin: string, document: DocumentMetadata, audience: Audience) {
+  const grant: Grant = { doc: document.id, hash: document.content_hash, exp: Date.now() + 300_000, audience };
   return contentOrigin + "/c/" + await seal(env.GRANT_KEY, grant);
 }
 
@@ -38,18 +31,15 @@ export async function grantedDocument(env: Bindings, token: string) {
   const audience = claims.audience;
   const query = "session" in audience
     ? env.DB.prepare(`
-      SELECT d.content, d.doc_key ${documentFilter}
+      SELECT d.content ${documentFilter}
       AND EXISTS (SELECT 1 FROM sessions WHERE id_hash = ?3 AND github_user_id = ?4 AND expires_at > ?5 AND revoked_at IS NULL)
     `).bind(claims.doc, claims.hash, audience.session, Number(env.OWNER_GITHUB_ID), date())
     : env.DB.prepare(`
-      SELECT d.content, d.doc_key ${documentFilter}
+      SELECT d.content ${documentFilter}
       AND d.visibility = 'shared'
       AND EXISTS (SELECT 1 FROM share_links WHERE id = ?3 AND policy_version = ?4
         AND project_id = d.project_id AND revoked_at IS NULL)
     `).bind(claims.doc, claims.hash, audience.link, audience.version);
-  const document = await query.first<{ content: string; doc_key: string }>();
-  return document && {
-    html: document.content, filename: document.doc_key.split("/").at(-1) ?? "plan.html",
-    download: "session" in audience && claims.download === true,
-  };
+  const document = await query.first<{ content: string }>();
+  return document && { html: document.content };
 }

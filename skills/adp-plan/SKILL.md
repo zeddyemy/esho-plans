@@ -51,6 +51,7 @@ Do not write the plan immediately if important context is missing. Ask focused d
    - Pass `--shared` only when the user explicitly asks to make this plan available to the client. With no visibility flag, new plans are internal and updates keep the existing visibility.
    - Report the private URL and any client URL returned. The CLI records the project ID and private URLs in `.plans/.postplan.json`. Point to this record once in project memory.
    - On exit 2, use the printed choices to ask for the project, then rerun with `--project <id>`. If the command is unavailable or fails otherwise, report why and confirm the local plan was saved. Avoid repeated retries. `esho-plans sync` can publish saved changes later.
+   - The published page shows only the plan. To change it later, use `esho-plans set <path> --shared` or `--internal`, and `esho-plans remove <path>` to take it off the hub. The local file is never deleted.
    - Done when the publish receipt is reported or the local-only result is explained.
 
 ## Recommended Plan Sections

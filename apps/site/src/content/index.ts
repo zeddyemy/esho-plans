@@ -22,11 +22,5 @@ content.get("/c/:grant", async (context) => {
     "frame-ancestors " + appOrigin,
   ].join("; "));
 
-  if (document.download) {
-    context.header("Content-Type", "application/octet-stream");
-    context.header("Content-Disposition", "attachment; filename*=UTF-8''" +
-      encodeURIComponent(document.filename).replace(/[!'()*]/g, (character) => "%" + character.charCodeAt(0).toString(16)));
-    return context.body(document.html);
-  }
   return context.html(document.html);
 });

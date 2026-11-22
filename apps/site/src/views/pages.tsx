@@ -1,6 +1,6 @@
 import type { Child } from "hono/jsx";
 import { sandbox } from "../lib/env";
-import type { Change, DocumentMetadata } from "../lib/documents";
+import type { DocumentMetadata } from "../lib/documents";
 import type { Project } from "../lib/projects";
 
 type Details = { url: string; requiresPasscode: boolean; lastUsedAt: string | null };
@@ -139,45 +139,11 @@ export function ProjectPage({ project, documents, link, csrf }: {
   </Page>;
 }
 
-export function OwnerReader({ project, document, changes, url, csrf }: {
-  project: Project; document: DocumentMetadata; changes: Change[]; url: string; csrf: string;
-}) {
-  const readerPath = "/p/" + project.id + "/d/" + document.id;
-  const action = "/d/" + document.id;
+// The reader is the document and nothing else. One small link leads back to the project.
+export function OwnerReader({ project, document, url }: { project: Project; document: DocumentMetadata; url: string }) {
   return <Page title={document.title} reader owner>
-    <header class="reader-bar">
-      <a href={"/p/" + project.id}>{project.name}</a>
-      <h1>{document.title}</h1>
-      <details>
-        <summary>Document options</summary>
-        <div class="actions">
-          <a class="button" href={readerPath + "/open"} target="_blank" rel="noreferrer noopener">Open in new tab</a>
-          <a class="button" href={readerPath + "/download"}>Download</a>
-        </div>
-        <form method="post" action={action} class="inline-form">
-          <input type="hidden" name="_csrf" value={csrf} />
-          <label>Visibility
-            <select name="visibility">
-              <option value="internal" selected={document.visibility === "internal"}>Internal</option>
-              <option value="shared" selected={document.visibility === "shared"}>Shared</option>
-            </select>
-          </label>
-          <button name="action" value="visibility">Save visibility</button>
-        </form>
-        <form method="post" action={action} class="inline-form">
-          <input type="hidden" name="_csrf" value={csrf} />
-          <label>Title<input name="title" value={document.title} required maxLength={300} /></label>
-          <button name="action" value="title">Rename</button>
-        </form>
-        <form method="post" action={action} data-confirm="Remove this document from the project?">
-          <input type="hidden" name="_csrf" value={csrf} />
-          <button name="action" value="delete">Remove document</button>
-        </form>
-        <h2>Change log</h2>
-        <ul class="changes">{changes.map((change) => <li><DateText value={change.created_at} /> {change.note}</li>)}</ul>
-      </details>
-    </header>
     <iframe title={document.title} src={url} sandbox={sandbox} referrerPolicy="no-referrer" />
+    <a class="reader-home" href={"/p/" + project.id}>{project.name}</a>
   </Page>;
 }
 
@@ -203,11 +169,8 @@ export function ClientPage({ name, token, documents }: {
 
 export function ClientReader({ title, token, url }: { title: string; token: string; url: string }) {
   return <Page title="Shared document" client reader>
-    <header class="reader-bar">
-      <a href={"/s/" + token}>Shared documents</a>
-      <h1>{title}</h1>
-    </header>
     <iframe title={title} src={url} sandbox={sandbox} referrerPolicy="no-referrer" />
+    <a class="reader-home" href={"/s/" + token}>Shared documents</a>
   </Page>;
 }
 

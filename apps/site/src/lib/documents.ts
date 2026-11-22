@@ -34,15 +34,6 @@ export function getDocument(db: D1Database, projectId: string, documentId: strin
     .bind(projectId, documentId).first<DocumentMetadata>();
 }
 
-export type Change = { note: string; created_at: string; git_branch: string | null; git_commit: string | null };
-
-export async function listChanges(db: D1Database, documentId: string) {
-  return (await db.prepare(`
-    SELECT note, created_at, git_branch, git_commit FROM document_changes WHERE document_id = ?
-    ORDER BY created_at DESC, rowid DESC
-  `).bind(documentId).all<Change>()).results;
-}
-
 export function parseVisibility(input: unknown): Visibility {
   if (input === "internal" || input === "shared") return input;
   throw new RequestError(400, "Visibility must be internal or shared.");

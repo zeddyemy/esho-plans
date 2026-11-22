@@ -19,6 +19,7 @@ const usage = `Usage
   esho-plans status [--workspace <dir>] [--json]
   esho-plans share [--replace | --revoke | --passcode <code> | --no-passcode] [--project <id|name>] [--json]
   esho-plans set <file|docId> --shared | --internal [--document <docId>] [--project <id|name>] [--json]
+  esho-plans remove <file|docId> [--project <id|name>] [--json]
   esho-plans projects [--json]`;
 
 const common = { help: { type: "boolean", short: "h" }, json: { type: "boolean" } } as const;
@@ -31,6 +32,7 @@ const commands = {
   status: { workspace: { type: "string" } },
   share: { ...project, replace: { type: "boolean" }, revoke: { type: "boolean" }, passcode: { type: "string" }, "no-passcode": { type: "boolean" } },
   set: { ...project, ...visibility, document: { type: "string" } },
+  remove: { ...project },
   projects: {},
 } as const;
 type Command = keyof typeof commands;
@@ -317,6 +319,35 @@ async function setVisibility(api: Api, origin: string, target: string, flags: Fl
   });
 }
 
+// Takes a document off the hub. The local file stays, and publishing it again puts it back as internal.
+async function removeDocument(api: Api, origin: string, target: string, flags: Flags) {
+  const suppliedId = /^doc_[A-Za-z0-9_-]{16}$/.test(target);
+  const targetFile = suppliedId ? null : await locate(target);
+  const root = targetFile?.root ?? await workspace(process.cwd());
+  await withRecordLock(root, async () => {
+    const previous = await readRecord(root, origin);
+    const { project: remote } = await projectFor(api, root, previous, option(flags, "project")?.trim() || undefined);
+    const record = recordFor(origin, remote, previous);
+    const { documents } = await api<{ documents: DocumentMetadata[] }>("/projects/" + remote.id + "/documents");
+    const key = targetFile?.key;
+    const matchId = suppliedId ? target : key && record.documents[key]?.id;
+    const match = documents.find((document) => matchId ? document.id === matchId : document.doc_key === key);
+    if (!match) throw new CliError(5, "Document not found in this project.");
+    const { removed } = await api<{ removed: { id: string; title: string; docKey: string } }>("/documents/" + match.id, "DELETE");
+    const entries = Object.keys(record.documents).filter((path) => record.documents[path].id === match.id);
+    for (const entry of entries) delete record.documents[entry];
+    if (entries.length && previous?.project.id === remote.id) await writeRecord(root, record);
+    // A visibility choice still waiting for the removed document has nothing left to apply to.
+    const pending = await readPendingVisibility(root, origin);
+    let cleared = false;
+    for (const entry of new Set([...entries, ...(key ? [key] : [])])) {
+      cleared = replacePending(pending, entry, (choice) => choice.project === remote.id) || cleared;
+    }
+    if (cleared) await writePendingVisibility(root, origin, pending);
+    print({ removed }, ["Removed " + removed.title + " from " + remote.name + ". The local file is unchanged."], !!flags.json);
+  });
+}
+
 async function readKey() {
   if (!process.stdin.isTTY) {
     const input = createInterface({ input: process.stdin, terminal: false });
@@ -391,7 +422,7 @@ try {
     if (flags.help) {
       console.log(usage);
     } else {
-      const required = name === "publish" || name === "set";
+      const required = name === "publish" || name === "set" || name === "remove";
       if (positionals.length !== (required ? 1 : 0)) throw new CliError(5, "Check the arguments with esho-plans --help.");
       const origin = apiOrigin();
       switch (name) {
@@ -401,6 +432,7 @@ try {
         case "status": await status(origin, flags); break;
         case "share": await share(await apiClient(origin), origin, flags); break;
         case "set": await setVisibility(await apiClient(origin), origin, positionals[0], flags); break;
+        case "remove": await removeDocument(await apiClient(origin), origin, positionals[0], flags); break;
         case "projects": {
           const { projects } = await (await apiClient(origin))<{ projects: Project[] }>("/projects");
           print({ projects }, projects.length ? projects.map((item) => item.id + "  " + item.name) : ["There are no projects."], !!flags.json);

@@ -227,6 +227,10 @@ async function projectsFixture(context, makeProjects) {
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
     const patched = /^\/api\/v1\/documents\/doc_(.+)$/.exec(request.url)?.[1];
+    if (patched && request.method === "DELETE" && state.documents[patched]) {
+      delete state.documents[patched];
+      return send(response, 200, { removed: { id: "doc_" + patched, title: "Plan", docKey: "plan.html" } });
+    }
     if (patched && request.method === "PATCH" && state.documents[patched]) {
       state.documents[patched].visibility = body.visibility;
       return send(response, 200, { document: listed(patched) });
@@ -447,6 +451,25 @@ test("a choice saved before the workspace has any project is never handed to a n
   const plain = await cli("publish", plan);
   assert.equal(plain.code, 0, plain.stderr);
   assert.equal(state.documents.prj_other.visibility, "internal");
+});
+
+test("remove takes a document off the hub and leaves the local file", async (context) => {
+  const { cli, plan, plans, root, original, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 0);
+  const removed = await cli("remove", plan, "--json");
+  assert.equal(removed.code, 0, removed.stderr);
+  assert.equal(JSON.parse(removed.stdout).removed.id, "doc_prj_alpha");
+  assert.equal(state.documents.prj_alpha, undefined);
+  assert.equal(await readFile(join(root, plan), "utf8"), original);
+  assert.deepEqual(JSON.parse(await readFile(join(plans, ".postplan.json"), "utf8")).documents, {});
+  const again = await cli("remove", plan);
+  assert.equal(again.code, 5);
+  assert.match(again.stderr, /not found/);
+  // Publishing the file again brings it back with the server's default visibility.
+  const back = await cli("publish", plan);
+  assert.equal(back.code, 0, back.stderr);
+  assert.equal(state.writes.at(-1).visibility, undefined);
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
 });
 
 test("a visibility change preserves the local content baseline when another copy is newer", async (context) => {

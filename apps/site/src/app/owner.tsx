@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { editDocument, getDocument, listChanges, listDocuments, parseVisibility } from "../lib/documents";
+import { getDocument, listDocuments } from "../lib/documents";
 import { date, type AppEnv } from "../lib/env";
 import { grantUrl } from "../lib/grants";
 import { createKey } from "../lib/keys";
@@ -69,18 +69,7 @@ owner.get("/p/:projectId/d/:docId", async (context) => {
   const content = context.get("contentOrigin");
   if (!content) return context.text("The document host is unavailable.", 503);
   const url = await grantUrl(env, content, document, { session: context.get("owner").idHash });
-  return context.html(<OwnerReader project={project} document={document} changes={await listChanges(env.DB, document.id)}
-    url={url} csrf={await csrf(context)} />);
-});
-
-owner.get("/p/:projectId/d/:docId/:action{open|download}", async (context) => {
-  const project = await getProject(context.env.DB, context.req.param("projectId"));
-  const document = project && await getDocument(context.env.DB, project.id, context.req.param("docId"));
-  if (!document) return context.notFound();
-  const content = context.get("contentOrigin");
-  if (!content) return context.text("The document host is unavailable.", 503);
-  const download = context.req.param("action") === "download";
-  return context.redirect(await grantUrl(context.env, content, document, { session: context.get("owner").idHash }, download));
+  return context.html(<OwnerReader project={project} document={document} url={url} />);
 });
 
 owner.post("/p/:projectId/link", async (context) => {
@@ -106,20 +95,6 @@ owner.post("/p/:projectId/link", async (context) => {
   }
   await changeLink(context.env, projectId, change);
   return context.redirect("/p/" + projectId, 303);
-});
-
-owner.post("/d/:docId", async (context) => {
-  const form = await context.req.parseBody();
-  const action = requiredFormText(form, "action");
-  if (action !== "title" && action !== "visibility" && action !== "delete") return context.text("Unknown document action.", 400);
-  const document = await editDocument(context.env.DB, context.req.param("docId"), {
-    title: action === "title" ? inputText(form.title, "Title", 300) : undefined,
-    visibility: action === "visibility" ? parseVisibility(form.visibility) : undefined,
-    remove: action === "delete",
-  });
-  if (!document) return context.notFound();
-  const projectPath = "/p/" + document.project_id;
-  return context.redirect(action === "delete" ? projectPath : projectPath + "/d/" + document.id, 303);
 });
 
 owner.get("/settings", async (context) => {
