@@ -8,11 +8,7 @@ import { type Api, CliError } from "./api.js";
 export type Visibility = "internal" | "shared";
 export type Project = { id: string; name: string; repo_hint: string | null; workspace_hint: string | null };
 export type DocumentMetadata = { id: string; doc_key: string; content_hash: string; visibility: Visibility; updated_at: string };
-// `removed` marks a document taken off the hub. The entry stays so that sync leaves the file alone and an
-// explicit publish restores the same document, including one whose file was renamed (docKey).
-export type RecordEntry = {
-  id: string; visibility: Visibility; privateUrl: string; contentHash?: string; publishedAt?: string; docKey?: string; removed?: true;
-};
+export type RecordEntry = { id: string; visibility: Visibility; privateUrl: string; contentHash?: string; publishedAt?: string; docKey?: string };
 export type WorkspaceRecord = { apiUrl: string; project: { id: string; name: string }; documents: Record<string, RecordEntry> };
 export type PendingVisibility = { visibility: Visibility; project?: string };
 // One file can have a pending choice for more than one project, so each file keeps a list.
@@ -20,6 +16,7 @@ export type PendingMap = Map<string, PendingVisibility[]>;
 
 const recordName = ".postplan.json";
 const pendingName = ".postplan.pending.json";
+const removalsName = ".postplan.removals.json";
 
 export async function workspace(start: string, exact = false) {
   let current = resolve(start);
@@ -120,6 +117,30 @@ export async function readPendingVisibility(root: string, origin: string) {
     if (error instanceof CliError) throw error;
     throw new CliError(5, "Could not read the pending publish record.");
   }
+}
+
+// A removal is written here before the request is sent and stays afterwards. Until it is confirmed, a retry can
+// finish it even if the server already removed the document. Afterwards it keeps sync from putting the file back.
+export type Removal = { project: string; document: string; keys: string[]; confirmed?: true };
+
+export async function readRemovals(root: string, origin: string): Promise<Removal[]> {
+  try {
+    const value = JSON.parse(await readFile(join(root, ".plans", removalsName), "utf8"));
+    if (value.apiUrl !== origin) throw new CliError(5, "The removal record is for a different API origin.");
+    const valid = Array.isArray(value.removals) && value.removals.every((entry: Removal) => entry && typeof entry.project === "string" &&
+      typeof entry.document === "string" && Array.isArray(entry.keys) && entry.keys.every((key) => typeof key === "string"));
+    if (!valid) throw new Error("Invalid removals.");
+    return value.removals;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    if (error instanceof CliError) throw error;
+    throw new CliError(5, "Could not read the removal record.");
+  }
+}
+
+export function writeRemovals(root: string, origin: string, removals: Removal[]) {
+  const path = join(root, ".plans", removalsName);
+  return removals.length ? writeJson(path, { apiUrl: origin, removals }) : rm(path, { force: true });
 }
 
 export function pendingFor(pending: PendingMap, key: string, matches: (entry: PendingVisibility) => boolean) {

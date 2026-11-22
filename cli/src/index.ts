@@ -7,8 +7,8 @@ import { parseArgs } from "node:util";
 import { apiClient, apiOrigin, CliError, keyFormat, saveCredentials, type Api } from "./api.js";
 import {
   contentHash, docKey, gitMetadata, htmlFiles, listProjects, locate, pendingFor, planHtml, projectFor, readPendingVisibility,
-  readRecord, replacePending, resolvePending, settlePending, unboundChoice, withRecordLock, workspace, writePendingVisibility,
-  writeRecord, type DocumentMetadata, type PendingMap, type PendingVisibility, type Project, type Visibility, type WorkspaceRecord,
+  readRecord, readRemovals, replacePending, resolvePending, settlePending, unboundChoice, withRecordLock, workspace, writePendingVisibility,
+  writeRecord, writeRemovals, type DocumentMetadata, type PendingMap, type PendingVisibility, type Project, type Visibility, type WorkspaceRecord,
 } from "./workspace.js";
 
 const usage = `Usage
@@ -160,9 +160,7 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     for (const path of files) {
       const key = await docKey(root, path);
       const html = await planHtml(path);
-      const known = previous?.documents[key];
-      // Sync leaves a removed document alone. Publishing the file by name restores it.
-      if (command === "sync" && !projectHint && (known?.removed || (!pending.has(key) && known?.contentHash === contentHash(html)))) {
+      if (command === "sync" && !projectHint && !pending.has(key) && previous?.documents[key]?.contentHash === contentHash(html)) {
         skipped += 1;
       } else {
         candidates.push({ path, key, html });
@@ -198,6 +196,18 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       changed = true;
     }
     if (changed) await writePendingVisibility(root, origin, pending);
+    // Sync leaves a removed document alone, however the project was chosen. Publishing the file by name restores it.
+    const removals = await readRemovals(root, origin);
+    const removedHere = (key: string) => removals.some((entry) => entry.project === remote.id && entry.keys.includes(key));
+    if (command === "sync") {
+      const kept = candidates.filter(({ key }) => !removedHere(key));
+      skipped += candidates.length - kept.length;
+      candidates.splice(0, candidates.length, ...kept);
+      if (!candidates.length) {
+        print({ published: [], skipped }, ["All plans are current."], !!flags.json);
+        return;
+      }
+    }
     stopForUnboundChoice(pending, !!lookup);
     const forThisProject = (entry: PendingVisibility) => entry.project === remote.id;
     for (const { key } of candidates) {
@@ -221,6 +231,12 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       if (canSave) await writeRecord(root, record);
       // Clear only the choice that was just applied.
       if (replacePending(pending, key, forThisProject)) await writePendingVisibility(root, origin, pending);
+      // The document is on the hub again, so it is no longer a removed one.
+      if (removedHere(key)) {
+        const remaining = (await readRemovals(root, origin)).filter((entry) => !(entry.project === remote.id && entry.keys.includes(key)));
+        removals.splice(0, removals.length, ...remaining);
+        await writeRemovals(root, origin, remaining);
+      }
       published.push(receipt);
       if (command === "sync" && !flags.json) console.log(receiptLines(receipt).join("\n"));
     }
@@ -236,9 +252,11 @@ async function status(origin: string, flags: Flags) {
     print({ project: null, documents: [] }, ["This workspace has no published plans."], !!flags.json);
     return;
   }
+  const removals = await readRemovals(root, origin);
   const documents = await Promise.all(Object.entries(record.documents).map(async ([path, entry]) => {
     const file = await readFile(resolve(root, ".plans", path), "utf8").catch(() => null);
-    const state = entry.removed ? "removed from the hub" : file === null ? "missing locally" : contentHash(file.replace(/^\uFEFF/, "")) === entry.contentHash ? "current" : "local changes";
+    const removed = removals.some((item) => item.project === record.project.id && item.keys.includes(path));
+    const state = removed ? "removed from the hub" : file === null ? "missing locally" : contentHash(file.replace(/^\uFEFF/, "")) === entry.contentHash ? "current" : "local changes";
     return { path, ...entry, state };
   }));
   print({ project: record.project, documents }, [
@@ -334,29 +352,44 @@ async function removeDocument(api: Api, origin: string, target: string, flags: F
     // Settle saved choices first, so one saved under this project's name is recognised as this project's.
     if ((await settlePending(api, root, previous, pending, projects)).changed) await writePendingVisibility(root, origin, pending);
     const { project: remote } = await projectFor(api, root, previous, option(flags, "project")?.trim() || undefined, false, undefined, projects);
-    const record = recordFor(origin, remote, previous);
+    const known = previous?.project.id === remote.id ? previous.documents : {};
     const { documents } = await api<{ documents: DocumentMetadata[] }>("/projects/" + remote.id + "/documents");
     const key = targetFile?.key;
-    const matchId = suppliedId ? target : key && record.documents[key]?.id;
+    const matchId = suppliedId ? target : key && known[key]?.id;
     const match = documents.find((document) => matchId ? document.id === matchId : document.doc_key === key);
-    if (!match) throw new CliError(5, "Document not found in this project.");
-    const { removed } = await api<{ removed: { id: string; title: string; docKey: string } }>("/documents/" + match.id, "DELETE");
-    const entries = new Set(Object.keys(record.documents).filter((path) => record.documents[path].id === match.id));
-    if (key) entries.add(key);
-    for (const entry of entries) {
-      const known = record.documents[entry];
-      record.documents[entry] = {
-        ...(known?.id === removed.id ? known : { privateUrl: origin + "/p/" + remote.id + "/d/" + removed.id }),
-        id: removed.id, visibility: "internal", removed: true,
-        ...(removed.docKey === entry ? {} : { docKey: removed.docKey }),
-      };
+    const removals = await readRemovals(root, origin);
+    // An earlier attempt that never heard back from the server is finished here once the document is gone.
+    let removal = removals.find((entry) => entry.project === remote.id && !entry.confirmed &&
+      (match ? entry.document === match.id : entry.document === matchId || (!!key && entry.keys.includes(key))));
+    if (!match && !removal) throw new CliError(5, "Document not found in this project.");
+    if (match) {
+      // Every path this document is known by: local files recorded for it, the file named now, and its key on the hub.
+      const keys = new Set([...Object.keys(known).filter((path) => known[path].id === match.id), match.doc_key, ...(removal?.keys ?? [])]);
+      if (key) keys.add(key);
+      const others = removals.filter((entry) => entry !== removal);
+      removal = { project: remote.id, document: match.id, keys: [...keys] };
+      removals.splice(0, removals.length, ...others, removal);
+      // Written before the request, so a lost response cannot leave this removal unfinished.
+      await writeRemovals(root, origin, removals);
+      // A waiting request to share is dropped now: if the answer is lost, a later publish must not bring the
+      // document back shared. A waiting request for internal stays until the removal is confirmed, because
+      // dropping it early could publish a private edit to a document that is still shared.
+      let unshared = false;
+      for (const path of keys) {
+        unshared = replacePending(pending, path, (choice) => choice.project === remote.id && choice.visibility === "shared") || unshared;
+      }
+      if (unshared) await writePendingVisibility(root, origin, pending);
+      await api("/documents/" + match.id, "DELETE");
     }
-    if (entries.size && (!previous || previous.project.id === remote.id)) await writeRecord(root, record);
+    const done = removal!;
     // A visibility choice still waiting for the removed document must not come back with it.
     let cleared = false;
-    for (const entry of entries) cleared = replacePending(pending, entry, (choice) => choice.project === remote.id) || cleared;
+    for (const path of done.keys) cleared = replacePending(pending, path, (choice) => choice.project === remote.id) || cleared;
     if (cleared) await writePendingVisibility(root, origin, pending);
-    print({ removed }, ["Removed " + removed.title + " from " + remote.name + ". The local file is unchanged."], !!flags.json);
+    done.confirmed = true;
+    await writeRemovals(root, origin, removals);
+    print({ removed: { id: done.document, paths: done.keys } },
+      ["Removed " + (match?.doc_key ?? done.keys[0] ?? done.document) + " from " + remote.name + ". The local file is unchanged."], !!flags.json);
   });
 }
 
