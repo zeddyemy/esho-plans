@@ -39,7 +39,7 @@ esho-plans set .plans/payment-flow.html --shared      # or --internal
 esho-plans remove .plans/payment-flow.html            # takes it off the hub; the local file stays
 ```
 
-`sync` leaves a removed file alone. Publishing it by name (`esho-plans publish <file>`) restores the same URL as internal, and any visibility choice that was still waiting for it is dropped. Removals are kept in `.plans/.postplan.removals.json`; if a removal's answer is lost, run `esho-plans remove` again to finish it. Keep the revision history inside the plan itself; the hub shows only the latest version.
+`sync` leaves a removed file alone. Publishing it by name (`esho-plans publish <file>`) restores the same URL as internal, and any visibility choice that was still waiting for it is dropped. Removals are kept in `.plans/.postplan.removals.json`; if a removal is not confirmed, `status` and `sync` say so and `sync` exits with an error; run `esho-plans remove` again to finish it. Publishing that file before then sends it as internal unless you pass `--shared`. Keep the revision history inside the plan itself; the hub shows only the latest version.
 
 ## Share or revoke
 

@@ -227,6 +227,7 @@ async function projectsFixture(context, makeProjects) {
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
     const patched = /^\/api\/v1\/documents\/doc_(.+)$/.exec(request.url)?.[1];
+    if (patched && request.method === "DELETE" && state.dropDelete) return request.socket.destroy();
     if (patched && request.method === "DELETE" && state.documents[patched]) {
       delete state.documents[patched];
       // The server removed it, but the answer never arrives.
@@ -587,11 +588,66 @@ test("a removal that is never confirmed cannot bring the document back shared", 
   assert.equal((await cli("remove", plan)).code, 4);
   state.loseDeleteResponse = false;
   await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
-  // No retry: the owner publishes the file again instead.
+  // No retry: the owner publishes the file again instead. The removal was never confirmed, so it goes up as internal.
   const back = await cli("publish", plan);
   assert.equal(back.code, 0, back.stderr);
-  assert.equal(state.writes.at(-1).visibility, undefined);
+  assert.equal(state.writes.at(-1).visibility, "internal");
   assert.equal(state.documents.prj_alpha.visibility, "internal");
+});
+
+test("a removal that never reached the server is reported and cannot publish an edit as shared", async (context) => {
+  const { cli, plan, root, original, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 0);
+  state.dropDelete = true;
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.dropDelete = false;
+  assert.equal(state.documents.prj_alpha.visibility, "shared");
+  assert.match((await cli("status")).stdout, /removal not confirmed, run esho-plans remove again/);
+
+  // Sync does not upload the edit, says why, and does not report success.
+  await writeFile(join(root, plan), original + "<p>Private edit</p>");
+  const writes = state.writes.length;
+  const syncing = await cli("sync", "--json");
+  assert.equal(syncing.code, 5);
+  assert.match(syncing.stderr, /removal of plan\.html was not confirmed/);
+  assert.deepEqual(JSON.parse(syncing.stdout), { published: [], skipped: 1, unconfirmed: ["plan.html"] });
+  assert.equal(state.writes.length, writes);
+
+  // Publishing the file anyway sends the edit as internal, although the document is still shared on the hub.
+  const published = await cli("publish", plan);
+  assert.equal(published.code, 0, published.stderr);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+  assert.doesNotMatch((await cli("status")).stdout, /removal/);
+
+  // Asking for shared again is honoured.
+  state.dropDelete = true;
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.dropDelete = false;
+  const shared = await cli("publish", plan, "--shared");
+  assert.equal(shared.code, 0, shared.stderr);
+  assert.equal(state.writes.at(-1).visibility, "shared");
+});
+
+test("a removed file that can no longer be read does not stop sync for other plans", async (context) => {
+  const { cli, plan, root, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha"), named("prj_beta", "Beta")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha")).code, 0);
+  assert.equal((await cli("remove", plan)).code, 0);
+  await writeFile(join(root, plan), "x".repeat(1_500_001));
+  await writeFile(join(root, ".plans/second.html"), "<!doctype html><title>Second</title><p>Second</p>");
+  const writes = state.writes.length;
+  const syncing = await cli("sync", "--json");
+  assert.equal(syncing.code, 0, syncing.stderr);
+  const result = JSON.parse(syncing.stdout);
+  assert.equal(result.published.length, 1);
+  assert.equal(result.skipped, 1);
+  assert.equal(state.writes.length, writes + 1);
+  assert.equal(state.writes.at(-1).docKey, "second.html");
+  // For a project where the file is not removed, the size limit still applies before anything is uploaded.
+  const other = await cli("sync", "--project", "prj_beta");
+  assert.equal(other.code, 5);
+  assert.match(other.stderr, /limited to 1500000 bytes/);
+  assert.equal(state.writes.length, writes + 1);
 });
 
 test("a visibility change preserves the local content baseline when another copy is newer", async (context) => {

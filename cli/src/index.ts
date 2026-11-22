@@ -155,15 +155,25 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       replacePending(pending, target.key, (entry) => entry.project === project, { visibility: selectedVisibility, project });
       await writePendingVisibility(root, origin, pending);
     }
-    const candidates: { path: string; key: string; html: string }[] = [];
+    const removals = await readRemovals(root, origin);
+    const candidates: { path: string; key: string; html: string; unreadable?: unknown }[] = [];
     let skipped = 0;
     for (const path of files) {
       const key = await docKey(root, path);
-      const html = await planHtml(path);
-      if (command === "sync" && !projectHint && !pending.has(key) && previous?.documents[key]?.contentHash === contentHash(html)) {
+      let html = "";
+      let unreadable: unknown;
+      try {
+        html = await planHtml(path);
+      } catch (error) {
+        // A removed file is not uploaded by sync, so its contents must not stop the other plans. Whether it is
+        // removed for this command's project is only known once that project is resolved.
+        if (command !== "sync" || !removals.some((entry) => entry.keys.includes(key))) throw error;
+        unreadable = error;
+      }
+      if (!unreadable && command === "sync" && !projectHint && !pending.has(key) && previous?.documents[key]?.contentHash === contentHash(html)) {
         skipped += 1;
       } else {
-        candidates.push({ path, key, html });
+        candidates.push({ path, key, html, unreadable });
       }
     }
     if (!candidates.length) {
@@ -197,17 +207,29 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     }
     if (changed) await writePendingVisibility(root, origin, pending);
     // Sync leaves a removed document alone, however the project was chosen. Publishing the file by name restores it.
-    const removals = await readRemovals(root, origin);
-    const removedHere = (key: string) => removals.some((entry) => entry.project === remote.id && entry.keys.includes(key));
+    const removalFor = (key: string) => removals.find((entry) => entry.project === remote.id && entry.keys.includes(key));
+    const removedHere = (key: string) => !!removalFor(key);
+    // A removal the server never confirmed: the document may still be on the hub with its old visibility.
+    const unconfirmed = candidates.filter(({ key }) => removalFor(key) && !removalFor(key)!.confirmed).map(({ key }) => key);
+    const reportUnconfirmed = () => {
+      if (command !== "sync" || !unconfirmed.length) return;
+      for (const key of unconfirmed) {
+        console.error("The removal of " + key + " was not confirmed, so it may still be on the hub. Run esho-plans remove .plans/" + key + " again.");
+      }
+      process.exitCode = 5;
+    };
     if (command === "sync") {
       const kept = candidates.filter(({ key }) => !removedHere(key));
       skipped += candidates.length - kept.length;
       candidates.splice(0, candidates.length, ...kept);
       if (!candidates.length) {
-        print({ published: [], skipped }, ["All plans are current."], !!flags.json);
+        print({ published: [], skipped, ...(unconfirmed.length ? { unconfirmed } : {}) }, ["All plans are current."], !!flags.json);
+        reportUnconfirmed();
         return;
       }
     }
+    const unread = candidates.find((candidate) => candidate.unreadable);
+    if (unread) throw unread.unreadable;
     stopForUnboundChoice(pending, !!lookup);
     const forThisProject = (entry: PendingVisibility) => entry.project === remote.id;
     for (const { key } of candidates) {
@@ -227,7 +249,10 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     if (created) console.error("Created project " + remote.name + " (" + remote.id + ").");
     for (const { path, key, html } of candidates) {
       const intent = pendingFor(pending, key, forThisProject);
-      const receipt = await publishFile(api, root, path, key, html, record, flags, intent?.visibility);
+      // Publishing over a removal that was never confirmed: the document may still be shared on the hub, so the
+      // edit goes up as internal unless the owner asked for shared again.
+      const visibility = intent?.visibility ?? (removalFor(key) && !removalFor(key)!.confirmed ? "internal" : undefined);
+      const receipt = await publishFile(api, root, path, key, html, record, flags, visibility);
       if (canSave) await writeRecord(root, record);
       // Clear only the choice that was just applied.
       if (replacePending(pending, key, forThisProject)) await writePendingVisibility(root, origin, pending);
@@ -241,7 +266,8 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       if (command === "sync" && !flags.json) console.log(receiptLines(receipt).join("\n"));
     }
     if (command === "publish") print(published[0], receiptLines(published[0]), !!flags.json);
-    else if (flags.json) print({ published, skipped }, [], true);
+    else if (flags.json) print({ published, skipped, ...(unconfirmed.length ? { unconfirmed } : {}) }, [], true);
+    reportUnconfirmed();
   });
 }
 
@@ -255,8 +281,10 @@ async function status(origin: string, flags: Flags) {
   const removals = await readRemovals(root, origin);
   const documents = await Promise.all(Object.entries(record.documents).map(async ([path, entry]) => {
     const file = await readFile(resolve(root, ".plans", path), "utf8").catch(() => null);
-    const removed = removals.some((item) => item.project === record.project.id && item.keys.includes(path));
-    const state = removed ? "removed from the hub" : file === null ? "missing locally" : contentHash(file.replace(/^\uFEFF/, "")) === entry.contentHash ? "current" : "local changes";
+    const removal = removals.find((item) => item.project === record.project.id && item.keys.includes(path));
+    const state = removal?.confirmed ? "removed from the hub"
+      : removal ? "removal not confirmed, run esho-plans remove again"
+      : file === null ? "missing locally" : contentHash(file.replace(/^\uFEFF/, "")) === entry.contentHash ? "current" : "local changes";
     return { path, ...entry, state };
   }));
   print({ project: record.project, documents }, [
