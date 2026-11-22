@@ -151,7 +151,7 @@ export function OwnerReader({ project, document, changes, url, csrf }: {
       <details>
         <summary>Document options</summary>
         <div class="actions">
-          <a class="button" href={url} target="_blank" rel="noreferrer noopener">Open in new tab</a>
+          <a class="button" href={readerPath + "/open"} target="_blank" rel="noreferrer noopener">Open in new tab</a>
           <a class="button" href={readerPath + "/download"}>Download</a>
         </div>
         <form method="post" action={action} class="inline-form">

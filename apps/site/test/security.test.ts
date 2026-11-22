@@ -234,6 +234,31 @@ describe("content host and owner controls", () => {
     expect((await http(path, { headers: { Cookie: "__Host-esho_session=" + expired } })).status).toBe(303);
   });
 
+  it("opens a fresh grant from the owner link after the reader's grant expires", async () => {
+    const project = await createProject("Open document fixture");
+    const { privateUrl } = await publish(project, "Open document");
+    const headers = { Cookie: ownerCookie };
+    const html = await (await http(privateUrl, { headers })).text();
+    const oldGrant = iframeSource(html);
+    const openUrl = /href="([^"]+)"[^>]*>Open in new tab<\/a>/.exec(html)?.[1];
+    expect(openUrl).toBe(new URL(privateUrl).pathname + "/open");
+    expect((await http(openUrl!)).status).toBe(303);
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 301_000);
+    try {
+      expect((await http(oldGrant)).status).toBe(404);
+      const redirect = await http(openUrl!, { headers });
+      expect(redirect.status).toBe(302);
+      expect(redirect.headers.get("Cache-Control")).toBe("no-store");
+      const freshGrant = redirect.headers.get("Location")!;
+      expect(freshGrant).not.toBe(oldGrant);
+      const response = await http(freshGrant);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(fixture);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("validates state and PKCE before permitting only the numeric GitHub owner", async () => {
     const begin = async () => {
       const response = await http("/auth/github");

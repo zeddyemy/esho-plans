@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, readdir, realpath, rename, rm, rmdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { type Api, CliError } from "./api.js";
@@ -8,10 +8,12 @@ import { type Api, CliError } from "./api.js";
 export type Visibility = "internal" | "shared";
 export type Project = { id: string; name: string; repo_hint: string | null; workspace_hint: string | null };
 export type DocumentMetadata = { id: string; doc_key: string; content_hash: string; visibility: Visibility; updated_at: string };
-export type RecordEntry = { id: string; visibility: Visibility; privateUrl: string; contentHash: string; publishedAt: string; docKey?: string };
+export type RecordEntry = { id: string; visibility: Visibility; privateUrl: string; contentHash?: string; publishedAt?: string; docKey?: string };
 export type WorkspaceRecord = { apiUrl: string; project: { id: string; name: string }; documents: Record<string, RecordEntry> };
+type PendingVisibility = { visibility: Visibility; project?: string };
 
 const recordName = ".postplan.json";
+const pendingName = ".postplan.pending.json";
 
 export async function workspace(start: string, exact = false) {
   let current = resolve(start);
@@ -68,13 +70,12 @@ export async function readRecord(root: string, origin: string) {
   }
 }
 
-export async function writeRecord(root: string, record: WorkspaceRecord) {
-  const destination = join(root, ".plans", recordName);
+async function writeJson(destination: string, value: unknown) {
   const temporary = destination + "." + randomUUID() + ".tmp";
   const file = await open(temporary, "wx", 0o600);
   try {
     try {
-      await file.writeFile(JSON.stringify(record, null, 2) + "\n");
+      await file.writeFile(JSON.stringify(value, null, 2) + "\n");
     } finally {
       await file.close();
     }
@@ -84,27 +85,125 @@ export async function writeRecord(root: string, record: WorkspaceRecord) {
   }
 }
 
+export function writeRecord(root: string, record: WorkspaceRecord) {
+  return writeJson(join(root, ".plans", recordName), record);
+}
+
+export async function readPendingVisibility(root: string, origin: string) {
+  try {
+    const value = JSON.parse(await readFile(join(root, ".plans", pendingName), "utf8"));
+    if (value.apiUrl !== origin) throw new CliError(5, "The pending publish record is for a different API origin.");
+    if (!value.documents || typeof value.documents !== "object" || Array.isArray(value.documents)) {
+      throw new Error("Invalid document map.");
+    }
+    const entries = Object.entries(value.documents) as [string, PendingVisibility][];
+    for (const [, entry] of entries) {
+      if (!entry || (entry.visibility !== "internal" && entry.visibility !== "shared") ||
+        (entry.project !== undefined && (typeof entry.project !== "string" || !entry.project.trim()))) {
+        throw new Error("Invalid pending visibility.");
+      }
+    }
+    return new Map(entries);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map<string, PendingVisibility>();
+    if (error instanceof CliError) throw error;
+    throw new CliError(5, "Could not read the pending publish record.");
+  }
+}
+
+export function writePendingVisibility(root: string, origin: string, pending: Map<string, PendingVisibility>) {
+  const path = join(root, ".plans", pendingName);
+  return pending.size ? writeJson(path, { apiUrl: origin, documents: Object.fromEntries(pending) }) : rm(path, { force: true });
+}
+
+function processIsGone(pid: string) {
+  if (!/^[1-9]\d*$/.test(pid)) return false;
+  try {
+    process.kill(Number(pid), 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+async function removeLockMarker(path: string, marker: string) {
+  await unlink(join(path, marker)).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+  });
+}
+
+async function removeEmptyLock(path: string) {
+  await rmdir(path).catch((error: NodeJS.ErrnoException) => {
+    if (!["ENOENT", "ENOTDIR", "ENOTEMPTY", "EEXIST"].includes(error.code ?? "")) throw error;
+  });
+}
+
+async function reclaimLock(path: string) {
+  const lock = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!lock) return;
+  if (lock.isDirectory()) {
+    const markers = await readdir(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return [];
+      throw error;
+    });
+    if (markers.length > 1) return;
+    if (markers.length === 1) {
+      const pid = /^([1-9]\d*)-[\da-f-]{36}$/.exec(markers[0])?.[1];
+      if (!pid || !processIsGone(pid)) return;
+      await removeLockMarker(path, markers[0]);
+    }
+    // rmdir only removes an empty directory. A contender may already have taken over.
+    await removeEmptyLock(path);
+  } else if (lock.isFile()) {
+    // Older CLI versions left a file with a PID, or an empty file if killed before writing it.
+    const pid = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "EISDIR") return null;
+      throw error;
+    });
+    if (pid === null || (!processIsGone(pid.trim()) && (pid !== "" || Date.now() - lock.mtimeMs < 20_000))) return;
+    const current = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (current?.isFile() && current.ino === lock.ino && current.dev === lock.dev) {
+      await unlink(path).catch((error: NodeJS.ErrnoException) => {
+        if (!["ENOENT", "EISDIR", "EPERM"].includes(error.code ?? "")) throw error;
+      });
+    }
+  }
+}
+
 export async function withRecordLock<T>(root: string, work: () => Promise<T>) {
   const path = join(root, ".plans", ".postplan.lock");
   if (await realpath(dirname(path)) !== dirname(path)) throw new CliError(5, ".plans must be inside the workspace.");
+  const candidate = await mkdtemp(path + "-");
+  const marker = process.pid + "-" + randomUUID();
   const until = Date.now() + 20_000;
-  for (;;) {
-    let file;
-    try {
-      file = await open(path, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (Date.now() >= until) throw new CliError(5, "Another publish is using this workspace. Try again when it finishes.");
-      await setTimeout(250);
-      continue;
+  try {
+    await (await open(join(candidate, marker), "wx", 0o600)).close();
+    for (;;) {
+      try {
+        // Install a directory that already contains its owner marker as one operation.
+        await rename(candidate, path);
+        break;
+      } catch (error) {
+        if (!["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        await reclaimLock(path);
+        if (Date.now() >= until) throw new CliError(5, "Another publish is using this workspace. Try again when it finishes.");
+        await setTimeout(250);
+      }
     }
     try {
-      await file.writeFile(String(process.pid));
       return await work();
     } finally {
-      await file.close();
-      await rm(path, { force: true });
+      await removeLockMarker(path, marker);
+      await removeEmptyLock(path);
     }
+  } finally {
+    await rm(candidate, { recursive: true, force: true });
   }
 }
 

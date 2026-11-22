@@ -70,13 +70,14 @@ owner.get("/p/:projectId/d/:docId", async (context) => {
     url={url} csrf={await csrf(context)} />);
 });
 
-owner.get("/p/:projectId/d/:docId/download", async (context) => {
+owner.get("/p/:projectId/d/:docId/:action{open|download}", async (context) => {
   const project = await getProject(context.env.DB, context.req.param("projectId"));
   const document = project && await getDocument(context.env.DB, project.id, context.req.param("docId"));
   if (!document) return context.notFound();
   const content = context.get("contentOrigin");
   if (!content) return context.text("The document host is unavailable.", 503);
-  return context.redirect(await grantUrl(context.env, content, document, { session: context.get("owner").idHash }, true));
+  const download = context.req.param("action") === "download";
+  return context.redirect(await grantUrl(context.env, content, document, { session: context.get("owner").idHash }, download));
 });
 
 owner.post("/p/:projectId/link", async (context) => {

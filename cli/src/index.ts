@@ -6,8 +6,9 @@ import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { apiClient, apiOrigin, CliError, keyFormat, saveCredentials, type Api } from "./api.js";
 import {
-  contentHash, docKey, gitMetadata, htmlFiles, locate, planHtml, projectFor, readRecord, withRecordLock,
-  workspace, writeRecord, type DocumentMetadata, type Project, type Visibility, type WorkspaceRecord,
+  contentHash, docKey, gitMetadata, htmlFiles, locate, planHtml, projectFor, readPendingVisibility, readRecord,
+  withRecordLock, workspace, writePendingVisibility, writeRecord, type DocumentMetadata, type Project,
+  type Visibility, type WorkspaceRecord,
 } from "./workspace.js";
 
 const usage = `Usage
@@ -75,7 +76,7 @@ function warnScriptHosts(html: string, path: string) {
   if (hosts.size) console.error("Some scripts in " + basename(path) + " may be blocked: " + [...hosts].join(", "));
 }
 
-async function publishFile(api: Api, root: string, path: string, key: string, html: string, record: WorkspaceRecord, flags: Flags) {
+async function publishFile(api: Api, root: string, path: string, key: string, html: string, record: WorkspaceRecord, flags: Flags, visibility?: Visibility) {
   const previous = record.documents[key];
   const git = gitMetadata(root, path);
   warnScriptHosts(html, path);
@@ -83,7 +84,7 @@ async function publishFile(api: Api, root: string, path: string, key: string, ht
     docKey: previous?.docKey ?? key,
     title: option(flags, "title") ?? titleFor(html, path),
     html,
-    visibility: visibilityFlag(flags),
+    visibility,
     note: option(flags, "note"),
     git: { branch: git.branch, commit: git.commit },
     expectedHash: previous?.contentHash,
@@ -119,12 +120,21 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
   }
   return withRecordLock(root, async () => {
     const previous = await readRecord(root, origin);
+    const pending = await readPendingVisibility(root, origin);
+    const projectHint = option(flags, "project")?.trim() || undefined;
+    const selectedVisibility = visibilityFlag(flags);
+    if (target && selectedVisibility) {
+      const project = projectHint ?? pending.get(target.key)?.project ?? previous?.project.id;
+      pending.set(target.key, { visibility: selectedVisibility, project });
+      await writePendingVisibility(root, origin, pending);
+    }
+    const lookup = projectHint ?? (target ? pending.get(target.key)?.project : undefined);
     const candidates: { path: string; key: string; html: string }[] = [];
     let skipped = 0;
     for (const path of files) {
       const key = await docKey(root, path);
       const html = await planHtml(path);
-      if (command === "sync" && !flags.project && previous?.documents[key]?.contentHash === contentHash(html)) {
+      if (command === "sync" && !projectHint && !pending.has(key) && previous?.documents[key]?.contentHash === contentHash(html)) {
         skipped += 1;
       } else {
         candidates.push({ path, key, html });
@@ -134,15 +144,30 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       print({ published: [], skipped }, ["All plans are current."], !!flags.json);
       return;
     }
+    if (!target && !lookup && !previous && candidates.some(({ key }) => pending.get(key)?.project)) {
+      throw new CliError(5, "Select the pending publish's project with --project or retry that file with publish.");
+    }
     const api = await apiClient(origin);
-    const { project: remote, created } = await projectFor(api, root, previous, option(flags, "project"), true, gitMetadata(root, candidates[0].path).remote);
+    const { project: remote, created } = await projectFor(api, root, previous, lookup, true, gitMetadata(root, candidates[0].path).remote);
+    for (const { key } of candidates) {
+      const intent = pending.get(key);
+      if (intent?.project && intent.project !== remote.id && intent.project !== lookup) {
+        throw new CliError(5, "Pending visibility for " + key + " belongs to another project. Retry that publish with its original project.");
+      }
+    }
     const record = recordFor(origin, remote, previous);
     const canSave = !previous || previous.project.id === remote.id;
     const published: Receipt[] = [];
     if (created) console.error("Created project " + remote.name + " (" + remote.id + ").");
     for (const { path, key, html } of candidates) {
-      const receipt = await publishFile(api, root, path, key, html, record, flags);
+      const intent = pending.get(key);
+      if (intent && intent.project !== remote.id) {
+        pending.set(key, { ...intent, project: remote.id });
+        await writePendingVisibility(root, origin, pending);
+      }
+      const receipt = await publishFile(api, root, path, key, html, record, flags, intent?.visibility);
       if (canSave) await writeRecord(root, record);
+      if (pending.delete(key)) await writePendingVisibility(root, origin, pending);
       published.push(receipt);
       if (command === "sync" && !flags.json) console.log(receiptLines(receipt).join("\n"));
     }
@@ -205,19 +230,32 @@ async function setVisibility(api: Api, origin: string, target: string, flags: Fl
   const root = targetFile?.root ?? await workspace(process.cwd());
   await withRecordLock(root, async () => {
     const previous = await readRecord(root, origin);
-    const { project: remote } = await projectFor(api, root, previous, option(flags, "project"));
+    const pending = await readPendingVisibility(root, origin);
+    const projectHint = option(flags, "project")?.trim() || undefined;
+    const { project: remote } = await projectFor(api, root, previous, projectHint);
     const record = recordFor(origin, remote, previous);
     const { documents } = await api<{ documents: DocumentMetadata[] }>("/projects/" + remote.id + "/documents");
     const key = targetFile?.key;
     const matchId = alias ?? (suppliedId ? target : key && record.documents[key]?.id);
     const match = documents.find((document) => matchId ? document.id === matchId : document.doc_key === key);
     if (!match) throw new CliError(5, "Document not found in this project.");
+    const entries = key ? [key] : Object.keys(record.documents).filter((path) => record.documents[path].id === match.id);
+    let updatedPending = false;
+    for (const entry of entries) {
+      const intent = pending.get(entry);
+      if (intent && (!intent.project || intent.project === remote.id || intent.project === projectHint)) {
+        pending.set(entry, { visibility: next, project: remote.id });
+        updatedPending = true;
+      }
+    }
+    if (updatedPending) await writePendingVisibility(root, origin, pending);
     const { document } = await api<{ document: DocumentMetadata }>("/documents/" + match.id, "PATCH", { visibility: next });
     const privateUrl = origin + "/p/" + remote.id + "/d/" + document.id;
-    const entries = key ? [key] : Object.keys(record.documents).filter((path) => record.documents[path].id === document.id);
     for (const entry of entries) {
+      const known = record.documents[entry];
       record.documents[entry] = {
-        id: document.id, visibility: document.visibility, privateUrl, contentHash: document.content_hash, publishedAt: document.updated_at,
+        id: document.id, visibility: document.visibility, privateUrl,
+        ...(known?.id === document.id ? { contentHash: known.contentHash, publishedAt: known.publishedAt } : {}),
         ...(document.doc_key === entry ? {} : { docKey: document.doc_key }),
       };
     }
