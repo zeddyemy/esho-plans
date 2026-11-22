@@ -30,6 +30,17 @@ jq -n --rawfile html .plans/payment-flow.html \
     "https://postplan.esho.dev/api/v1/projects/${project_id}/documents"
 ```
 
+## Read, change or remove a document
+
+A document's private URL shows the document and nothing else, with one small link in the corner back to its project. Changes are commands:
+
+```sh
+esho-plans set .plans/payment-flow.html --shared      # or --internal
+esho-plans remove .plans/payment-flow.html            # takes it off the hub; the local file stays
+```
+
+`sync` leaves a removed file alone. Publishing it by name (`esho-plans publish <file>`) restores the same URL as internal, and any visibility choice that was still waiting for it is dropped. Removals are kept in `.plans/.postplan.removals.json`; if a removal is not confirmed, `status` and `sync` say so and `sync` exits with an error; run `esho-plans remove` again to finish it. The message gives the exact retry command, with the document and project IDs. Restoring a removed file with `publish` always sends it as internal unless you pass `--shared`. Keep the revision history inside the plan itself; the hub shows only the latest version.
+
 ## Share or revoke
 
 Open a project in the owner view. In **Client link**, choose **Create client link**, then **Copy link**. Only documents marked **Shared** appear to the client. **Replace link** issues a new link and invalidates the old one. **Turn off link** revokes it immediately. Set a passcode in the same panel if the client should need both the URL and a passcode.

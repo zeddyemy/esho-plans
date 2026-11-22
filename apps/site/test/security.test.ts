@@ -176,7 +176,7 @@ describe("project isolation and revocation over HTTP", () => {
 });
 
 describe("content host and owner controls", () => {
-  it("enforces both sandboxes, the content CSP, and an attachment outside the app origin", async () => {
+  it("enforces both sandboxes and the content CSP, and shows the document with no controls", async () => {
     const project = await createProject("Sandbox fixture project");
     const { privateUrl } = await publish(project, "Owner sandbox fixture");
     const reader = await http(privateUrl, { headers: { Cookie: ownerCookie } });
@@ -204,12 +204,14 @@ describe("content host and owner controls", () => {
     for (const path of ["/", "/healthz", "/settings", "/auth/github", "/api/v1/projects", "/app.css", "/sitemap.xml"]) {
       expect(await snapshot(await http(content + path))).toEqual(missing);
     }
-    const download = await http(privateUrl + "/download", { headers: { Cookie: ownerCookie } });
-    const attachment = await http(download.headers.get("Location")!);
-    expect(attachment.headers.get("Content-Disposition")).toContain("attachment");
-    expect(attachment.headers.get("Content-Type")).toBe("application/octet-stream");
-    expect(new TextDecoder().decode(await attachment.arrayBuffer())).toBe(fixture);
     expect((await http(app + new URL(url).pathname)).status).toBe(303);
+    // The reader page is the document frame and one link back to the project, with no controls.
+    expect(html.match(/<body[^>]*>([\s\S]*)<\/body>/)![1].replace(/<iframe[^>]*><\/iframe>/, "FRAME"))
+      .toBe('FRAME<a class="reader-home" href="/p/' + project + '">Sandbox fixture project</a>');
+    expect(html).not.toMatch(/<form|<button|_csrf/);
+    for (const gone of ["/download", "/open"]) {
+      expect((await http(privateUrl + gone, { headers: { Cookie: ownerCookie } })).status).toBe(404);
+    }
   });
 
   it("requires CSRF and same origin for owner mutations and refuses an expired session", async () => {
@@ -234,22 +236,17 @@ describe("content host and owner controls", () => {
     expect((await http(path, { headers: { Cookie: "__Host-esho_session=" + expired } })).status).toBe(303);
   });
 
-  it("opens a fresh grant from the owner link after the reader's grant expires", async () => {
-    const project = await createProject("Open document fixture");
-    const { privateUrl } = await publish(project, "Open document");
+  it("issues a fresh grant when the reader is reloaded after its grant expires", async () => {
+    const project = await createProject("Reload fixture");
+    const { privateUrl } = await publish(project, "Reload document");
     const headers = { Cookie: ownerCookie };
-    const html = await (await http(privateUrl, { headers })).text();
-    const oldGrant = iframeSource(html);
-    const openUrl = /href="([^"]+)"[^>]*>Open in new tab<\/a>/.exec(html)?.[1];
-    expect(openUrl).toBe(new URL(privateUrl).pathname + "/open");
-    expect((await http(openUrl!)).status).toBe(303);
+    const oldGrant = iframeSource(await (await http(privateUrl, { headers })).text());
     const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 301_000);
     try {
       expect((await http(oldGrant)).status).toBe(404);
-      const redirect = await http(openUrl!, { headers });
-      expect(redirect.status).toBe(302);
-      expect(redirect.headers.get("Cache-Control")).toBe("no-store");
-      const freshGrant = redirect.headers.get("Location")!;
+      const reloaded = await http(privateUrl, { headers });
+      expect(reloaded.headers.get("Cache-Control")).toBe("no-store");
+      const freshGrant = iframeSource(await reloaded.text());
       expect(freshGrant).not.toBe(oldGrant);
       const response = await http(freshGrant);
       expect(response.status).toBe(200);
@@ -257,6 +254,33 @@ describe("content host and owner controls", () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it("removes a document through the API only, and cuts off its reader, client page and grants", async () => {
+    const project = await createProject("Removal fixture");
+    const { document, privateUrl } = await publish(project, "Removable", "shared");
+    const shared = await link(project);
+    const headers = { Cookie: ownerCookie };
+    const ownerGrant = iframeSource(await (await http(privateUrl, { headers })).text());
+    const clientGrant = iframeSource(await (await http(shared.url + "/d/" + document.id)).text());
+    const proof = csrfValue(await (await http("/p/" + project, { headers })).text());
+    // The owner pages no longer change documents.
+    expect((await post("/d/" + document.id, { action: "delete", _csrf: proof })).status).toBe(404);
+    expect((await http(privateUrl, { headers })).status).toBe(200);
+    expect((await http("/api/v1/documents/" + document.id, { method: "DELETE", headers })).status).toBe(401);
+
+    const removed = await json<{ removed: { id: string } }>(await api("/documents/" + document.id, "DELETE"));
+    expect(removed.removed.id).toBe(document.id);
+    expect((await api("/documents/" + document.id, "DELETE")).status).toBe(404);
+    for (const url of [shared.url + "/d/" + document.id, ownerGrant, clientGrant]) expect((await http(url)).status).toBe(404);
+    expect((await http(privateUrl, { headers })).status).toBe(404);
+    expect(await (await http(shared.url)).text()).not.toContain("Removable");
+
+    // Publishing the same path again restores the same URL as internal.
+    const restored = await publish(project, "Removable");
+    expect(restored.privateUrl).toBe(privateUrl);
+    expect(restored.document.visibility).toBe("internal");
+    expect((await http(shared.url + "/d/" + document.id)).status).toBe(404);
   });
 
   it("validates state and PKCE before permitting only the numeric GitHub owner", async () => {

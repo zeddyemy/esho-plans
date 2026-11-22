@@ -69,6 +69,12 @@ api.patch("/documents/:id", async (context) => {
   return context.json({ document });
 });
 
+api.delete("/documents/:id", async (context) => {
+  const document = await editDocument(context.env.DB, context.req.param("id"), { remove: true });
+  if (!document) throw new RequestError(404, "Document not found.");
+  return context.json({ removed: { id: document.id, title: document.title, docKey: document.doc_key } });
+});
+
 api.get("/projects/:id/link", async (context) => {
   const id = context.req.param("id");
   if (!await getProject(context.env.DB, id)) throw new RequestError(404, "Project not found.");

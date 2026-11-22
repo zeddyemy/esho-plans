@@ -227,6 +227,13 @@ async function projectsFixture(context, makeProjects) {
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
     const patched = /^\/api\/v1\/documents\/doc_(.+)$/.exec(request.url)?.[1];
+    if (patched && request.method === "DELETE" && state.dropDelete) return request.socket.destroy();
+    if (patched && request.method === "DELETE" && state.documents[patched]) {
+      delete state.documents[patched];
+      // The server removed it, but the answer never arrives.
+      if (state.loseDeleteResponse) return request.socket.destroy();
+      return send(response, 200, { removed: { id: "doc_" + patched, title: "Plan", docKey: "plan.html" } });
+    }
     if (patched && request.method === "PATCH" && state.documents[patched]) {
       state.documents[patched].visibility = body.visibility;
       return send(response, 200, { document: listed(patched) });
@@ -237,7 +244,7 @@ async function projectsFixture(context, makeProjects) {
     state.documents[id] = { visibility };
     return send(response, 200, {
       ...successReceipt,
-      document: { ...successReceipt.document, id: "doc_" + id, visibility, contentHash: fixtureHash(body.html) },
+      document: { ...successReceipt.document, id: state.receiptId ?? "doc_" + id, visibility, contentHash: fixtureHash(body.html) },
     });
   });
   server.listen(0, "127.0.0.1");
@@ -447,6 +454,342 @@ test("a choice saved before the workspace has any project is never handed to a n
   const plain = await cli("publish", plan);
   assert.equal(plain.code, 0, plain.stderr);
   assert.equal(state.documents.prj_other.visibility, "internal");
+});
+
+test("remove takes a document off the hub, sync leaves it alone, and publish restores it as internal", async (context) => {
+  const { cli, plan, plans, root, original, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 0);
+  // The file was renamed after its first publish, so the record carries the document's original key.
+  const recordFile = join(plans, ".postplan.json");
+  const renamed = JSON.parse(await readFile(recordFile, "utf8"));
+  renamed.documents["plan.html"].docKey = "first-name.html";
+  await writeFile(recordFile, JSON.stringify(renamed));
+  // A shared choice is still waiting, saved under the project's name.
+  await writeFile(join(root, plan), original + "<p>Edit</p>");
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--project", "Alpha", "--shared")).code, 4);
+  state.offline = false;
+
+  const removed = await cli("remove", plan, "--json");
+  assert.equal(removed.code, 0, removed.stderr);
+  assert.equal(JSON.parse(removed.stdout).removed.id, "doc_prj_alpha");
+  assert.equal(state.documents.prj_alpha, undefined);
+  assert.equal(await readFile(join(root, plan), "utf8"), original + "<p>Edit</p>");
+  await assert.rejects(readFile(join(plans, ".postplan.pending.json")), { code: "ENOENT" });
+  assert.match((await cli("status")).stdout, /removed from the hub/);
+
+  // The changed file is not put back by sync, with or without --project, and a second remove fails cleanly.
+  const writes = state.writes.length;
+  for (const scope of [[], ["--project", "prj_alpha"], ["--project", "Alpha"]]) {
+    const syncing = await cli("sync", "--json", ...scope);
+    assert.equal(syncing.code, 0, syncing.stderr);
+    assert.deepEqual(JSON.parse(syncing.stdout), { published: [], skipped: 1 });
+    assert.equal(state.writes.length, writes);
+  }
+  const again = await cli("remove", plan);
+  assert.equal(again.code, 5);
+  assert.match(again.stderr, /not found/);
+
+  // Publishing the file by name restores the same document key with no visibility request, so it is internal.
+  const back = await cli("publish", plan);
+  assert.equal(back.code, 0, back.stderr);
+  assert.equal(state.writes.length, writes + 1);
+  assert.equal(state.writes.at(-1).docKey, "first-name.html");
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+  await assert.rejects(readFile(join(plans, ".postplan.removals.json")), { code: "ENOENT" });
+  assert.doesNotMatch((await cli("status")).stdout, /removed from the hub/);
+});
+
+test("remove keeps a visibility choice that belongs to another project", async (context) => {
+  const { cli, plan, state, pendingFile } = await projectsFixture(context, () => [named("prj_alpha", "Alpha"), named("prj_beta", "Beta")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha")).code, 0);
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--project", "Beta", "--shared")).code, 4);
+  assert.equal((await cli("publish", plan, "--project", "Alpha", "--shared")).code, 4);
+  state.offline = false;
+  assert.equal((await cli("remove", plan)).code, 0);
+  assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], [{ visibility: "shared", project: "prj_beta" }]);
+});
+
+test("remove by document ID clears the choice waiting for that document's file, with no local record", async (context) => {
+  const { cli, plan, plans, state, pendingFile } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  // The document is on the hub, published from elsewhere. Here only a failed shared publish is waiting.
+  state.documents.prj_alpha = { visibility: "internal" };
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 4);
+  state.offline = false;
+  await assert.rejects(readFile(join(plans, ".postplan.json")), { code: "ENOENT" });
+  // The mock's document IDs are short, so pass one in the real format that the mock also serves.
+  state.documents.aaaaaaaaaaaaaaaa = state.documents.prj_alpha;
+  delete state.documents.prj_alpha;
+  state.projects = [named("aaaaaaaaaaaaaaaa", "Alpha")];
+  await writeFile(pendingFile, JSON.stringify({ apiUrl: JSON.parse(await readFile(pendingFile, "utf8")).apiUrl,
+    documents: { "plan.html": [{ visibility: "shared", project: "aaaaaaaaaaaaaaaa" }] } }));
+
+  const removed = await cli("remove", "doc_aaaaaaaaaaaaaaaa", "--project", "aaaaaaaaaaaaaaaa", "--json");
+  assert.equal(removed.code, 0, removed.stderr);
+  assert.deepEqual(JSON.parse(removed.stdout).removed, { id: "doc_aaaaaaaaaaaaaaaa", paths: ["plan.html"] });
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+  await assert.rejects(readFile(join(plans, ".postplan.json")), { code: "ENOENT" });
+  const back = await cli("publish", plan, "--project", "aaaaaaaaaaaaaaaa");
+  assert.equal(back.code, 0, back.stderr);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.aaaaaaaaaaaaaaaa.visibility, "internal");
+});
+
+test("a removal whose answer is lost is finished by a retry, and a failed one loses nothing", async (context) => {
+  const { cli, plan, root, original, state, pendingFile } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 0);
+  await writeFile(join(root, plan), original + "<p>Edit</p>");
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--internal")).code, 4);
+  const waiting = [{ visibility: "internal", project: "prj_alpha" }];
+
+  // The request never reaches the server: nothing is recorded, the document is still shared there, and the
+  // internal choice survives, so the next sync publishes the edit as internal.
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.offline = false;
+  assert.equal(state.documents.prj_alpha.visibility, "shared");
+  assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+  assert.equal(JSON.parse((await cli("sync", "--json")).stdout).published.length, 1);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+
+  // Share it again and queue another internal edit.
+  assert.equal((await cli("publish", plan, "--shared")).code, 0);
+  await writeFile(join(root, plan), original + "<p>Second edit</p>");
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--internal")).code, 4);
+  state.offline = false;
+  const writes = state.writes.length;
+
+  // The server removes it but the answer is lost. The choice still waits until a retry confirms the removal.
+  state.loseDeleteResponse = true;
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.loseDeleteResponse = false;
+  assert.equal(state.documents.prj_alpha, undefined);
+  assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+  const retry = await cli("remove", plan);
+  assert.equal(retry.code, 0, retry.stderr);
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+  assert.equal((await cli("remove", plan)).code, 5);
+  assert.deepEqual(JSON.parse((await cli("sync", "--json")).stdout), { published: [], skipped: 1 });
+  assert.equal(state.writes.length, writes);
+});
+
+test("a removal that is never confirmed cannot bring the document back shared", async (context) => {
+  const { cli, plan, root, original, state, pendingFile } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha")).code, 0);
+  await writeFile(join(root, plan), original + "<p>Edit</p>");
+  state.offline = true;
+  assert.equal((await cli("publish", plan, "--shared")).code, 4);
+  state.offline = false;
+  state.loseDeleteResponse = true;
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.loseDeleteResponse = false;
+  await assert.rejects(readFile(pendingFile), { code: "ENOENT" });
+  // No retry: the owner publishes the file again instead. The removal was never confirmed, so it goes up as internal.
+  const back = await cli("publish", plan);
+  assert.equal(back.code, 0, back.stderr);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+});
+
+test("a removal that never reached the server is reported and cannot publish an edit as shared", async (context) => {
+  const { cli, plan, root, original, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 0);
+  state.dropDelete = true;
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.dropDelete = false;
+  assert.equal(state.documents.prj_alpha.visibility, "shared");
+  const retryCommand = /Run esho-plans remove doc_prj_alpha --project prj_alpha/;
+  const shown = await cli("status");
+  assert.match(shown.stdout, /plan\.html · shared · removal not confirmed/);
+  assert.match(shown.stdout, retryCommand);
+  // Reported even though the file is unchanged and nothing needs uploading.
+  const idle = await cli("sync", "--json");
+  assert.equal(idle.code, 5);
+  assert.match(idle.stderr, retryCommand);
+  assert.equal(JSON.parse(idle.stdout).unconfirmed[0].retry, "esho-plans remove doc_prj_alpha --project prj_alpha");
+
+  // Sync does not upload the edit, says why, and does not report success.
+  await writeFile(join(root, plan), original + "<p>Private edit</p>");
+  const writes = state.writes.length;
+  const syncing = await cli("sync", "--json");
+  assert.equal(syncing.code, 5);
+  assert.match(syncing.stderr, /removal of plan\.html was not confirmed/);
+  assert.match(syncing.stderr, retryCommand);
+  assert.deepEqual(JSON.parse(syncing.stdout), { published: [], skipped: 1, unconfirmed: [{ document: "doc_prj_alpha",
+    project: "prj_alpha", paths: ["plan.html"], retry: "esho-plans remove doc_prj_alpha --project prj_alpha" }] });
+  assert.equal(state.writes.length, writes);
+
+  // Publishing the file anyway sends the edit as internal, although the document is still shared on the hub.
+  const published = await cli("publish", plan);
+  assert.equal(published.code, 0, published.stderr);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+  assert.doesNotMatch((await cli("status")).stdout, /removal/);
+
+  // Asking for shared again is honoured.
+  state.dropDelete = true;
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.dropDelete = false;
+  const shared = await cli("publish", plan, "--shared");
+  assert.equal(shared.code, 0, shared.stderr);
+  assert.equal(state.writes.at(-1).visibility, "shared");
+});
+
+test("the retry for an interrupted removal names its own document and project", async (context) => {
+  // Real-format IDs, so the printed retry command can be run as given. The mock's document ID is doc_<project>.
+  const alpha = "aaaaaaaaaaaaaaaa";
+  const beta = "bbbbbbbbbbbbbbbb";
+  const { cli, plan, plans, state } = await projectsFixture(context, () => [named(alpha, "Alpha"), named(beta, "Beta")]);
+  assert.equal((await cli("publish", plan, "--project", alpha, "--shared")).code, 0);
+  assert.equal((await cli("publish", plan, "--project", beta, "--shared")).code, 0);
+  state.dropDelete = true;
+  assert.equal((await cli("remove", plan, "--project", beta)).code, 4);
+  state.dropDelete = false;
+  const retry = "esho-plans remove doc_" + beta + " --project " + beta;
+  const syncing = await cli("sync", "--project", beta);
+  assert.equal(syncing.code, 5);
+  assert.ok(syncing.stderr.includes("Run " + retry), syncing.stderr);
+  // Running exactly that command removes Beta's document and leaves Alpha's, the workspace default, alone.
+  const done = await cli(...retry.split(" ").slice(1));
+  assert.equal(done.code, 0, done.stderr);
+  assert.equal(state.documents[beta], undefined);
+  assert.equal(state.documents[alpha].visibility, "shared");
+  assert.equal(JSON.parse(await readFile(join(plans, ".postplan.removals.json"), "utf8")).removals.length, 1);
+  assert.equal((await cli("sync")).code, 0);
+});
+
+test("an interrupted removal by ID is reported in a workspace with no publish record", async (context) => {
+  const alpha = "aaaaaaaaaaaaaaaa";
+  const { cli, plans, state } = await projectsFixture(context, () => [named(alpha, "Alpha")]);
+  state.documents[alpha] = { visibility: "shared" };
+  state.dropDelete = true;
+  assert.equal((await cli("remove", "doc_" + alpha, "--project", alpha)).code, 4);
+  state.dropDelete = false;
+  await assert.rejects(readFile(join(plans, ".postplan.json")), { code: "ENOENT" });
+  const shown = await cli("status", "--json");
+  assert.equal(shown.code, 0, shown.stderr);
+  assert.deepEqual(JSON.parse(shown.stdout).unconfirmed, [{ document: "doc_" + alpha, project: alpha, paths: ["plan.html"],
+    retry: "esho-plans remove doc_" + alpha + " --project " + alpha }]);
+  assert.match((await cli("status")).stdout, /was not confirmed/);
+});
+
+test("restoring a removed document is internal even if it was shared again from elsewhere", async (context) => {
+  const { cli, plan, plans, root, original, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha", "--shared")).code, 0);
+  assert.equal((await cli("remove", plan)).code, 0);
+  // Another computer restores the same document as shared.
+  state.documents.prj_alpha = { visibility: "shared" };
+  await writeFile(join(root, plan), original + "<p>Private edit</p>");
+  const restored = await cli("publish", plan);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.equal(state.writes.at(-1).visibility, "internal");
+  assert.equal(state.documents.prj_alpha.visibility, "internal");
+
+  // A second, interrupted removal after an earlier confirmed one leaves a single unconfirmed entry.
+  assert.equal((await cli("remove", plan)).code, 0);
+  state.documents.prj_alpha = { visibility: "shared" };
+  state.dropDelete = true;
+  assert.equal((await cli("remove", plan)).code, 4);
+  state.dropDelete = false;
+  const entries = JSON.parse(await readFile(join(plans, ".postplan.removals.json"), "utf8")).removals;
+  assert.deepEqual(entries, [{ project: "prj_alpha", document: "doc_prj_alpha", keys: ["plan.html"] }]);
+  assert.match((await cli("status")).stdout, /plan\.html · \w+ · removal not confirmed/);
+});
+
+test("publishing a path reassigned to another document leaves the first document's removal in place", async (context) => {
+  const { cli, plan, plans, root, original, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha")).code, 0);
+  assert.equal((await cli("remove", plan)).code, 0);
+  // The path is then assigned to a different document, as set --document does.
+  const recordFile = join(plans, ".postplan.json");
+  const record = JSON.parse(await readFile(recordFile, "utf8"));
+  record.documents["plan.html"].id = "doc_other";
+  await writeFile(recordFile, JSON.stringify(record));
+  assert.doesNotMatch((await cli("status")).stdout, /removed from the hub/);
+  state.receiptId = "doc_other";
+  await writeFile(join(root, plan), original + "<p>Edit to the other document</p>");
+  const published = await cli("publish", plan);
+  assert.equal(published.code, 0, published.stderr);
+  assert.equal(state.writes.at(-1).visibility, undefined);
+  assert.deepEqual(JSON.parse(await readFile(join(plans, ".postplan.removals.json"), "utf8")).removals,
+    [{ project: "prj_alpha", document: "doc_prj_alpha", keys: ["plan.html"], confirmed: true }]);
+});
+
+test("removing a document keeps the choice waiting for another document that now uses its path", async (context) => {
+  const alpha = "aaaaaaaaaaaaaaaa";
+  const first = "doc_" + alpha;
+  for (const interrupted of [false, true]) {
+    const { cli, plan, plans, root, original, state, pendingFile } = await projectsFixture(context, () => [named(alpha, "Alpha")]);
+    assert.equal((await cli("publish", plan, "--project", alpha)).code, 0);
+    // The path is assigned to a second, shared document, as set --document does.
+    const recordFile = join(plans, ".postplan.json");
+    const record = JSON.parse(await readFile(recordFile, "utf8"));
+    record.documents["plan.html"].id = "doc_bbbbbbbbbbbbbbbb";
+    await writeFile(recordFile, JSON.stringify(record));
+    await writeFile(join(root, plan), original + "<p>Private edit to the second document</p>");
+    state.offline = true;
+    assert.equal((await cli("publish", plan, "--internal")).code, 4);
+    state.offline = false;
+    const waiting = [{ visibility: "internal", project: alpha }];
+
+    if (interrupted) {
+      // The answer is lost, and the retry finishes the removal.
+      state.loseDeleteResponse = true;
+      assert.equal((await cli("remove", first, "--project", alpha)).code, 4);
+      state.loseDeleteResponse = false;
+      assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+    }
+    const removed = await cli("remove", first, "--project", alpha);
+    assert.equal(removed.code, 0, removed.stderr);
+    assert.deepEqual(JSON.parse(await readFile(pendingFile, "utf8")).documents["plan.html"], waiting);
+
+    // The second document is shared on the hub. Its edit must go up as internal.
+    state.documents[alpha] = { visibility: "shared" };
+    state.receiptId = "doc_bbbbbbbbbbbbbbbb";
+    const syncing = await cli("sync", "--json");
+    assert.equal(syncing.code, 0, syncing.stderr);
+    assert.equal(state.writes.at(-1).visibility, "internal");
+    assert.equal(state.documents[alpha].visibility, "internal");
+  }
+});
+
+test("sync reports an unconfirmed removal in a workspace with no plans", async (context) => {
+  const alpha = "aaaaaaaaaaaaaaaa";
+  const { cli, plan, root, state } = await projectsFixture(context, () => [named(alpha, "Alpha")]);
+  await rm(join(root, plan));
+  state.documents[alpha] = { visibility: "shared" };
+  state.dropDelete = true;
+  assert.equal((await cli("remove", "doc_" + alpha, "--project", alpha)).code, 4);
+  state.dropDelete = false;
+  const syncing = await cli("sync", "--project", alpha, "--json");
+  assert.equal(syncing.code, 5);
+  assert.equal(JSON.parse(syncing.stdout).unconfirmed[0].retry, "esho-plans remove doc_" + alpha + " --project " + alpha);
+  assert.match(syncing.stderr, /was not confirmed/);
+});
+
+test("a removed file that can no longer be read does not stop sync for other plans", async (context) => {
+  const { cli, plan, root, state } = await projectsFixture(context, () => [named("prj_alpha", "Alpha"), named("prj_beta", "Beta")]);
+  assert.equal((await cli("publish", plan, "--project", "prj_alpha")).code, 0);
+  assert.equal((await cli("remove", plan)).code, 0);
+  await writeFile(join(root, plan), "x".repeat(1_500_001));
+  await writeFile(join(root, ".plans/second.html"), "<!doctype html><title>Second</title><p>Second</p>");
+  const writes = state.writes.length;
+  const syncing = await cli("sync", "--json");
+  assert.equal(syncing.code, 0, syncing.stderr);
+  const result = JSON.parse(syncing.stdout);
+  assert.equal(result.published.length, 1);
+  assert.equal(result.skipped, 1);
+  assert.equal(state.writes.length, writes + 1);
+  assert.equal(state.writes.at(-1).docKey, "second.html");
+  // For a project where the file is not removed, the size limit still applies before anything is uploaded.
+  const other = await cli("sync", "--project", "prj_beta");
+  assert.equal(other.code, 5);
+  assert.match(other.stderr, /limited to 1500000 bytes/);
+  assert.equal(state.writes.length, writes + 1);
 });
 
 test("a visibility change preserves the local content baseline when another copy is newer", async (context) => {
