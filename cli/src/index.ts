@@ -160,7 +160,9 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     for (const path of files) {
       const key = await docKey(root, path);
       const html = await planHtml(path);
-      if (command === "sync" && !projectHint && !pending.has(key) && previous?.documents[key]?.contentHash === contentHash(html)) {
+      const known = previous?.documents[key];
+      // Sync leaves a removed document alone. Publishing the file by name restores it.
+      if (command === "sync" && !projectHint && (known?.removed || (!pending.has(key) && known?.contentHash === contentHash(html)))) {
         skipped += 1;
       } else {
         candidates.push({ path, key, html });
@@ -236,7 +238,7 @@ async function status(origin: string, flags: Flags) {
   }
   const documents = await Promise.all(Object.entries(record.documents).map(async ([path, entry]) => {
     const file = await readFile(resolve(root, ".plans", path), "utf8").catch(() => null);
-    const state = file === null ? "missing locally" : contentHash(file.replace(/^\uFEFF/, "")) === entry.contentHash ? "current" : "local changes";
+    const state = entry.removed ? "removed from the hub" : file === null ? "missing locally" : contentHash(file.replace(/^\uFEFF/, "")) === entry.contentHash ? "current" : "local changes";
     return { path, ...entry, state };
   }));
   print({ project: record.project, documents }, [
@@ -319,14 +321,19 @@ async function setVisibility(api: Api, origin: string, target: string, flags: Fl
   });
 }
 
-// Takes a document off the hub. The local file stays, and publishing it again puts it back as internal.
+// Takes a document off the hub. The local file stays. Sync skips it from then on, and publishing the file by
+// name puts the same document back as internal.
 async function removeDocument(api: Api, origin: string, target: string, flags: Flags) {
   const suppliedId = /^doc_[A-Za-z0-9_-]{16}$/.test(target);
   const targetFile = suppliedId ? null : await locate(target);
   const root = targetFile?.root ?? await workspace(process.cwd());
   await withRecordLock(root, async () => {
     const previous = await readRecord(root, origin);
-    const { project: remote } = await projectFor(api, root, previous, option(flags, "project")?.trim() || undefined);
+    const pending = await readPendingVisibility(root, origin);
+    const projects = await listProjects(api);
+    // Settle saved choices first, so one saved under this project's name is recognised as this project's.
+    if ((await settlePending(api, root, previous, pending, projects)).changed) await writePendingVisibility(root, origin, pending);
+    const { project: remote } = await projectFor(api, root, previous, option(flags, "project")?.trim() || undefined, false, undefined, projects);
     const record = recordFor(origin, remote, previous);
     const { documents } = await api<{ documents: DocumentMetadata[] }>("/projects/" + remote.id + "/documents");
     const key = targetFile?.key;
@@ -334,15 +341,20 @@ async function removeDocument(api: Api, origin: string, target: string, flags: F
     const match = documents.find((document) => matchId ? document.id === matchId : document.doc_key === key);
     if (!match) throw new CliError(5, "Document not found in this project.");
     const { removed } = await api<{ removed: { id: string; title: string; docKey: string } }>("/documents/" + match.id, "DELETE");
-    const entries = Object.keys(record.documents).filter((path) => record.documents[path].id === match.id);
-    for (const entry of entries) delete record.documents[entry];
-    if (entries.length && previous?.project.id === remote.id) await writeRecord(root, record);
-    // A visibility choice still waiting for the removed document has nothing left to apply to.
-    const pending = await readPendingVisibility(root, origin);
-    let cleared = false;
-    for (const entry of new Set([...entries, ...(key ? [key] : [])])) {
-      cleared = replacePending(pending, entry, (choice) => choice.project === remote.id) || cleared;
+    const entries = new Set(Object.keys(record.documents).filter((path) => record.documents[path].id === match.id));
+    if (key) entries.add(key);
+    for (const entry of entries) {
+      const known = record.documents[entry];
+      record.documents[entry] = {
+        ...(known?.id === removed.id ? known : { privateUrl: origin + "/p/" + remote.id + "/d/" + removed.id }),
+        id: removed.id, visibility: "internal", removed: true,
+        ...(removed.docKey === entry ? {} : { docKey: removed.docKey }),
+      };
     }
+    if (entries.size && (!previous || previous.project.id === remote.id)) await writeRecord(root, record);
+    // A visibility choice still waiting for the removed document must not come back with it.
+    let cleared = false;
+    for (const entry of entries) cleared = replacePending(pending, entry, (choice) => choice.project === remote.id) || cleared;
     if (cleared) await writePendingVisibility(root, origin, pending);
     print({ removed }, ["Removed " + removed.title + " from " + remote.name + ". The local file is unchanged."], !!flags.json);
   });

@@ -8,7 +8,11 @@ import { type Api, CliError } from "./api.js";
 export type Visibility = "internal" | "shared";
 export type Project = { id: string; name: string; repo_hint: string | null; workspace_hint: string | null };
 export type DocumentMetadata = { id: string; doc_key: string; content_hash: string; visibility: Visibility; updated_at: string };
-export type RecordEntry = { id: string; visibility: Visibility; privateUrl: string; contentHash?: string; publishedAt?: string; docKey?: string };
+// `removed` marks a document taken off the hub. The entry stays so that sync leaves the file alone and an
+// explicit publish restores the same document, including one whose file was renamed (docKey).
+export type RecordEntry = {
+  id: string; visibility: Visibility; privateUrl: string; contentHash?: string; publishedAt?: string; docKey?: string; removed?: true;
+};
 export type WorkspaceRecord = { apiUrl: string; project: { id: string; name: string }; documents: Record<string, RecordEntry> };
 export type PendingVisibility = { visibility: Visibility; project?: string };
 // One file can have a pending choice for more than one project, so each file keeps a list.
