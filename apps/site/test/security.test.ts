@@ -297,6 +297,23 @@ describe("content host and owner controls", () => {
       expect(cookie).toBeTruthy();
       for (const flag of ["Secure", "HttpOnly", "SameSite=Lax", "Path=/"]) expect(cookie).toContain(flag);
       expect(cookie).not.toMatch(/Domain=/i);
+      expect(signedIn.headers.get("Location")).toBe("/");
+
+      // A signed-out visit to an owner page is remembered. Anything else falls back to the project list.
+      const asked = await http("/cli/auth");
+      expect(asked.status).toBe(303);
+      expect(asked.headers.get("Location")).toBe("/");
+      const remembered = asked.headers.getSetCookie().find((value) => value.startsWith("__Host-esho_return="))!.split(";")[0];
+      expect((await http("/unknown/page")).headers.getSetCookie()).toHaveLength(0);
+      for (const [returnCookie, destination] of [
+        [remembered, "/cli/auth"], ["__Host-esho_return=https://example.com/", "/"], ["__Host-esho_return=//example.com", "/"],
+      ]) {
+        const again = await begin();
+        challenge = again.authorize.searchParams.get("code_challenge");
+        const returned = await callback(again.authorize.searchParams.get("state")!, again.cookie + "; " + returnCookie);
+        expect(returned.status).toBe(303);
+        expect(returned.headers.get("Location")).toBe(destination);
+      }
     } finally {
       vi.unstubAllGlobals();
     }

@@ -6,7 +6,7 @@ import { grantUrl } from "../lib/grants";
 import { createKey } from "../lib/keys";
 import { getProject, listProjects } from "../lib/projects";
 import { inputText, RequestError, requiredFormText, sameOrigin } from "../lib/request";
-import { clearSession, csrf, findSession, refreshSession, validCsrf } from "../lib/sessions";
+import { clearSession, csrf, findSession, refreshSession, rememberReturnPath, validCsrf } from "../lib/sessions";
 import { activeLink, changeLink, linkDetails, normalizePasscode, type LinkChange } from "../lib/shares";
 import { OwnerReader, ProjectPage, ProjectsPage, PublishKeyPage, SettingsPage, SignIn } from "../views/pages";
 
@@ -22,7 +22,10 @@ owner.get("/", async (context) => {
 
 owner.use("*", async (context, next) => {
   const session = await findSession(context);
-  if (!session) return context.redirect("/", 303);
+  if (!session) {
+    rememberReturnPath(context);
+    return context.redirect("/", 303);
+  }
   context.set("owner", session);
   const method = context.req.method;
   if (method === "POST") {

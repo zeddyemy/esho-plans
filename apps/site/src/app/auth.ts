@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import { hash, randomToken } from "../lib/crypto";
 import { date, type AppEnv } from "../lib/env";
-import { createSession, hostCookie } from "../lib/sessions";
+import { createSession, hostCookie, takeReturnPath } from "../lib/sessions";
 
 const oauthCookie = "__Host-esho_oauth";
 const oauthSeconds = 600;
@@ -84,5 +84,5 @@ auth.get("/github/callback", async (context) => {
     return context.text("This GitHub account does not have access.", 403);
   }
   await createSession(context, profile.id);
-  return context.redirect("/", 303);
+  return context.redirect(takeReturnPath(context), 303);
 });

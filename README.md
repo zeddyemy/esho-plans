@@ -54,7 +54,7 @@ pnpm test
 pnpm build
 ```
 
-The app listens on `http://127.0.0.1:8787` and serves local documents from `http://localhost:8787`. Use the exact address for each origin. Configure local secrets in `apps/site/.dev.vars` using the example as a list of names. For local OAuth, configure a development OAuth app with the exact callback URL for the local app origin. The test suite provides its own bindings and GitHub responses.
+The app listens on `http://127.0.0.1:8787` and serves local documents from `http://localhost:8787`. Use the exact address for each origin. `pnpm dev` runs the `dev` environment in `apps/site/wrangler.jsonc`, which has no route so that Wrangler keeps these loopback hostnames. Deploy without `--env`. Configure local secrets in `apps/site/.dev.vars` using the example as a list of names. For local OAuth, configure a development OAuth app with the exact callback URL for the local app origin. The test suite provides its own bindings and GitHub responses.
 
 With `ESHO_PLANS_API_KEY` set to a key for the chosen environment, run `./scripts/verify.sh <base-url>` for an HTTP smoke test. It creates two verification projects, exercises publishing and both origins, and revokes the test links on exit. Project IDs are printed so the fixtures can be identified.
 

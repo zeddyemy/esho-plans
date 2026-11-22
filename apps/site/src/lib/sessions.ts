@@ -53,3 +53,20 @@ export function csrf(context: Context<AppEnv>) {
 export function validCsrf(context: Context<AppEnv>, submitted: string) {
   return verifyMac(context.env.SESSION_KEY, "csrf:" + context.get("owner").token, submitted);
 }
+
+const returnCookie = "__Host-esho_return";
+const returnPath = /^\/(?:settings|cli\/auth|p\/prj_[A-Za-z0-9_-]{16}(?:\/d\/doc_[A-Za-z0-9_-]{16})?)$/;
+
+// Signing in returns the owner to the page they asked for. Only fixed owner paths qualify, so this cannot redirect off-site.
+export function rememberReturnPath(context: Context<AppEnv>) {
+  if (context.req.method === "GET" && returnPath.test(context.req.path)) {
+    setCookie(context, returnCookie, context.req.path, { ...hostCookie, maxAge: 600 });
+  }
+}
+
+export function takeReturnPath(context: Context<AppEnv>) {
+  const path = getCookie(context, returnCookie);
+  if (path === undefined) return "/";
+  setCookie(context, returnCookie, "", { ...hostCookie, maxAge: 0 });
+  return returnPath.test(path) ? path : "/";
+}

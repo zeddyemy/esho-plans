@@ -23,5 +23,27 @@
     "CONTENT_HOST": "esho-plans.zeddyemy.workers.dev",
     "OWNER_GITHUB_ID": "51033541",
     "GITHUB_CLIENT_ID": "Ov23li196xGI9UsEvfcD"
+  },
+  "env": {
+    // Local development only. With a route configured, wrangler dev rewrites every request to the route's
+    // hostname, which hides the loopback hostnames the Worker uses to tell the app from the content origin.
+    "dev": {
+      "routes": [],
+      "workers_dev": false,
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "esho-plans",
+          "database_id": "8086fa0f-db08-4511-9068-2cc88cd4013b"
+        }
+      ],
+      "vars": {
+        "APP_HOST": "postplan.esho.dev",
+        "CONTENT_HOST": "localhost",
+        "OWNER_GITHUB_ID": "51033541",
+        "GITHUB_CLIENT_ID": "",
+        "LOCAL_DEV": "true"
+      }
+    }
   }
 }
