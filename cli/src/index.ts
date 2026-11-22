@@ -8,7 +8,7 @@ import { apiClient, apiOrigin, CliError, keyFormat, saveCredentials, type Api } 
 import {
   contentHash, docKey, gitMetadata, htmlFiles, listProjects, locate, pendingFor, planHtml, projectFor, readPendingVisibility,
   readRecord, readRemovals, replacePending, resolvePending, settlePending, unboundChoice, withRecordLock, workspace, writePendingVisibility,
-  writeRecord, writeRemovals, type DocumentMetadata, type PendingMap, type PendingVisibility, type Project, type Visibility, type WorkspaceRecord,
+  writeRecord, writeRemovals, type DocumentMetadata, type PendingMap, type PendingVisibility, type Project, type Removal, type Visibility, type WorkspaceRecord,
 } from "./workspace.js";
 
 const usage = `Usage
@@ -119,6 +119,19 @@ function stopForUnboundChoice(pending: PendingMap, namedProject: boolean) {
   }
 }
 
+// Removal attempts the server never confirmed. Each names its own document and project, so the retry cannot
+// land on a file of the same name in another project.
+function outstandingRemovals(removals: Removal[]) {
+  return removals.filter((entry) => !entry.confirmed).map((entry) => ({
+    document: entry.document, project: entry.project, paths: entry.keys,
+    retry: "esho-plans remove " + entry.document + " --project " + entry.project,
+  }));
+}
+
+function removalNotice(item: { document: string; paths: string[]; retry: string }) {
+  return "The removal of " + (item.paths[0] ?? item.document) + " was not confirmed, so it may still be on the hub. Run " + item.retry;
+}
+
 function recordFor(origin: string, remote: Project, previous: WorkspaceRecord | null) {
   if (previous?.project.id === remote.id) return previous;
   return { apiUrl: origin, project: { id: remote.id, name: remote.name }, documents: {} } satisfies WorkspaceRecord;
@@ -176,8 +189,19 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
         candidates.push({ path, key, html, unreadable });
       }
     }
+    // Every sync reports removals that are still unconfirmed, even when no file needs uploading.
+    const reportUnconfirmed = () => {
+      const outstanding = command === "sync" ? outstandingRemovals(removals) : [];
+      for (const item of outstanding) console.error(removalNotice(item));
+      if (outstanding.length) process.exitCode = 5;
+    };
+    const unconfirmedJson = () => {
+      const outstanding = command === "sync" ? outstandingRemovals(removals) : [];
+      return outstanding.length ? { unconfirmed: outstanding } : {};
+    };
     if (!candidates.length) {
-      print({ published: [], skipped }, ["All plans are current."], !!flags.json);
+      print({ published: [], skipped, ...unconfirmedJson() }, ["All plans are current."], !!flags.json);
+      reportUnconfirmed();
       return;
     }
     if (!target && !projectHint && !previous && candidates.some(({ key }) => pending.get(key)?.some((entry) => entry.project))) {
@@ -209,21 +233,12 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     // Sync leaves a removed document alone, however the project was chosen. Publishing the file by name restores it.
     const removalFor = (key: string) => removals.find((entry) => entry.project === remote.id && entry.keys.includes(key));
     const removedHere = (key: string) => !!removalFor(key);
-    // A removal the server never confirmed: the document may still be on the hub with its old visibility.
-    const unconfirmed = candidates.filter(({ key }) => removalFor(key) && !removalFor(key)!.confirmed).map(({ key }) => key);
-    const reportUnconfirmed = () => {
-      if (command !== "sync" || !unconfirmed.length) return;
-      for (const key of unconfirmed) {
-        console.error("The removal of " + key + " was not confirmed, so it may still be on the hub. Run esho-plans remove .plans/" + key + " again.");
-      }
-      process.exitCode = 5;
-    };
     if (command === "sync") {
       const kept = candidates.filter(({ key }) => !removedHere(key));
       skipped += candidates.length - kept.length;
       candidates.splice(0, candidates.length, ...kept);
       if (!candidates.length) {
-        print({ published: [], skipped, ...(unconfirmed.length ? { unconfirmed } : {}) }, ["All plans are current."], !!flags.json);
+        print({ published: [], skipped, ...unconfirmedJson() }, ["All plans are current."], !!flags.json);
         reportUnconfirmed();
         return;
       }
@@ -249,9 +264,9 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
     if (created) console.error("Created project " + remote.name + " (" + remote.id + ").");
     for (const { path, key, html } of candidates) {
       const intent = pendingFor(pending, key, forThisProject);
-      // Publishing over a removal that was never confirmed: the document may still be shared on the hub, so the
-      // edit goes up as internal unless the owner asked for shared again.
-      const visibility = intent?.visibility ?? (removalFor(key) && !removalFor(key)!.confirmed ? "internal" : undefined);
+      // Restoring a document this workspace removed. It may still be on the hub, or back there as shared from
+      // another computer, so the edit goes up as internal unless the owner asks for shared.
+      const visibility = intent?.visibility ?? (removalFor(key) ? "internal" : undefined);
       const receipt = await publishFile(api, root, path, key, html, record, flags, visibility);
       if (canSave) await writeRecord(root, record);
       // Clear only the choice that was just applied.
@@ -266,7 +281,7 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
       if (command === "sync" && !flags.json) console.log(receiptLines(receipt).join("\n"));
     }
     if (command === "publish") print(published[0], receiptLines(published[0]), !!flags.json);
-    else if (flags.json) print({ published, skipped, ...(unconfirmed.length ? { unconfirmed } : {}) }, [], true);
+    else if (flags.json) print({ published, skipped, ...unconfirmedJson() }, [], true);
     reportUnconfirmed();
   });
 }
@@ -274,21 +289,26 @@ async function runPublish(origin: string, command: "publish" | "sync", flags: Fl
 async function status(origin: string, flags: Flags) {
   const root = await workspace(option(flags, "workspace") ?? process.cwd(), flags.workspace !== undefined);
   const record = await readRecord(root, origin);
+  const removals = await readRemovals(root, origin);
+  // Shown whether or not this workspace has a publish record or the file is listed in it.
+  const outstanding = outstandingRemovals(removals);
+  const notices = outstanding.map(removalNotice);
   if (!record) {
-    print({ project: null, documents: [] }, ["This workspace has no published plans."], !!flags.json);
+    print({ project: null, documents: [], ...(outstanding.length ? { unconfirmed: outstanding } : {}) },
+      ["This workspace has no published plans.", ...notices], !!flags.json);
     return;
   }
-  const removals = await readRemovals(root, origin);
   const documents = await Promise.all(Object.entries(record.documents).map(async ([path, entry]) => {
     const file = await readFile(resolve(root, ".plans", path), "utf8").catch(() => null);
-    const removal = removals.find((item) => item.project === record.project.id && item.keys.includes(path));
-    const state = removal?.confirmed ? "removed from the hub"
-      : removal ? "removal not confirmed, run esho-plans remove again"
+    const here = removals.filter((item) => item.project === record.project.id && item.keys.includes(path));
+    const state = here.some((item) => !item.confirmed) ? "removal not confirmed"
+      : here.length ? "removed from the hub"
       : file === null ? "missing locally" : contentHash(file.replace(/^\uFEFF/, "")) === entry.contentHash ? "current" : "local changes";
     return { path, ...entry, state };
   }));
-  print({ project: record.project, documents }, [
+  print({ project: record.project, documents, ...(outstanding.length ? { unconfirmed: outstanding } : {}) }, [
     record.project.name, ...documents.map((entry) => entry.path + " · " + entry.visibility + " · " + entry.state + " · " + entry.privateUrl),
+    ...notices,
   ], !!flags.json);
 }
 
@@ -392,9 +412,12 @@ async function removeDocument(api: Api, origin: string, target: string, flags: F
     if (!match && !removal) throw new CliError(5, "Document not found in this project.");
     if (match) {
       // Every path this document is known by: local files recorded for it, the file named now, and its key on the hub.
-      const keys = new Set([...Object.keys(known).filter((path) => known[path].id === match.id), match.doc_key, ...(removal?.keys ?? [])]);
+      // A new attempt replaces every earlier entry for this document, confirmed or not, and keeps their paths.
+      const earlier = removals.filter((entry) => entry.project === remote.id && entry.document === match.id);
+      const keys = new Set([...Object.keys(known).filter((path) => known[path].id === match.id), match.doc_key,
+        ...earlier.flatMap((entry) => entry.keys)]);
       if (key) keys.add(key);
-      const others = removals.filter((entry) => entry !== removal);
+      const others = removals.filter((entry) => !earlier.includes(entry));
       removal = { project: remote.id, document: match.id, keys: [...keys] };
       removals.splice(0, removals.length, ...others, removal);
       // Written before the request, so a lost response cannot leave this removal unfinished.
