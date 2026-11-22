@@ -59,7 +59,8 @@ auth.get("/github/callback", async (context) => {
   try {
     const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
       method: "POST",
-      redirect: "error",
+      // The Workers runtime rejects redirect: "error". A redirect is left unfollowed and fails the ok check below.
+      redirect: "manual",
       headers: { Accept: "application/json" },
       body: new URLSearchParams({
         client_id: env.GITHUB_CLIENT_ID,
@@ -72,12 +73,13 @@ auth.get("/github/callback", async (context) => {
     const token = tokenResponse.ok ? await tokenResponse.json<{ access_token?: string }>() : null;
     if (!token?.access_token) return context.text("GitHub could not verify this sign-in.", 403);
     const userResponse = await fetch("https://api.github.com/user", {
-      redirect: "error",
+      redirect: "manual",
       headers: { Accept: "application/vnd.github+json", Authorization: "Bearer " + token.access_token, "User-Agent": "esho-plans" },
     });
     if (!userResponse.ok) return context.text("GitHub could not verify this sign-in.", 403);
     profile = await userResponse.json();
-  } catch {
+  } catch (error) {
+    console.error("GitHub sign-in request failed", error instanceof Error ? error.name : "unknown");
     return context.text("GitHub sign-in is temporarily unavailable.", 503);
   }
   if (typeof profile.id !== "number" || !Number.isSafeInteger(profile.id) || String(profile.id) !== env.OWNER_GITHUB_ID) {

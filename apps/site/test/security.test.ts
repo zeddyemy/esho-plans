@@ -273,7 +273,11 @@ describe("content host and owner controls", () => {
     expect((await callback(randomToken(), wrong.cookie)).status).toBe(403);
     let user = 42;
     let challenge = wrong.authorize.searchParams.get("code_challenge");
+    let redirected = "";
     const outbound = vi.fn(async (url: string, init: RequestInit) => {
+      // Building the request makes the runtime check the options, as a real fetch would.
+      expect(new Request(url, init).redirect).toBe("manual");
+      if (url === redirected) return new Response(null, { status: 302, headers: { Location: "https://example.com/" } });
       if (url === "https://github.com/login/oauth/access_token") {
         const body = init.body as URLSearchParams;
         expect(await hash(body.get("code_verifier")!)).toBe(challenge);
@@ -298,6 +302,17 @@ describe("content host and owner controls", () => {
       for (const flag of ["Secure", "HttpOnly", "SameSite=Lax", "Path=/"]) expect(cookie).toContain(flag);
       expect(cookie).not.toMatch(/Domain=/i);
       expect(signedIn.headers.get("Location")).toBe("/");
+
+      // A redirect from either GitHub endpoint is refused, not followed.
+      for (const endpoint of ["https://github.com/login/oauth/access_token", "https://api.github.com/user"]) {
+        const attempt = await begin();
+        challenge = attempt.authorize.searchParams.get("code_challenge");
+        redirected = endpoint;
+        const refused = await callback(attempt.authorize.searchParams.get("state")!, attempt.cookie);
+        expect(refused.status).toBe(403);
+        expect(refused.headers.getSetCookie().some((value) => value.startsWith("__Host-esho_session="))).toBe(false);
+      }
+      redirected = "";
 
       // A signed-out visit to an owner page is remembered. Anything else falls back to the project list.
       const asked = await http("/cli/auth");
